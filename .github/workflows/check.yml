@@ -115,6 +115,31 @@ jobs:
           python c/tools/make_glm53_tiny.py --output /tmp/glm53_tiny
           python c/tools/check_glm53_checkpoint.py --model /tmp/glm53_tiny
 
+  vk-build:
+    # Compile+link gate for the dsv4 Vulkan tier (VK=1): upstream CI has no
+    # GPU, so this only proves the tier builds against the current tree. It
+    # protects the rebase-fail-fast seam (a new upstream dsv4_cuda_* call that
+    # the Vulkan backend hasn't implemented fails this link loudly) and the
+    # VK=0 byte-parity guarantee (the default build path is untouched). The
+    # L1/L2/L4 suites need a Vulkan ICD + the 160 GB checkpoint and run on
+    # maintainers' GPU hosts (scripts/vk_parity.sh).
+    name: Linux (dsv4 VK=1 compile gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan dev headers + glslc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev
+          # shaderc provides glslc (only needed if a .comp is newer than its
+          # committed .spv); glslang-tools is the fallback provider.
+          sudo apt-get install -y shaderc || sudo apt-get install -y glslang-tools
+      - name: Build the dsv4 engine with the Vulkan tier
+        run: make -C c deepseek-v4 VK=1
+      - name: Verify the VK=0 default build is unaffected
+        run: make -C c deepseek-v4
+
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
     # single-threaded automatically if it's ever missing).

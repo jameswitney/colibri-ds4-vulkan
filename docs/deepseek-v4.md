@@ -1,4 +1,4 @@
-# DeepSeek V4 target engine (CPU + optional CUDA tier)
+# DeepSeek V4 target engine (CPU + optional CUDA / Vulkan tier)
 
 [简体中文](deepseek-v4.zh-CN.md) (older; this English page is the reference)
 
@@ -66,6 +66,25 @@ CPU engine (all platforms):
 cd c
 make deepseek-v4            # ARCH=native for the local CPU (default x86-64-v3)
 ```
+
+### Linux Vulkan tier (`VK=1`)
+
+Opt-in Vulkan compute tier for AMD/Intel GPUs (the CUDA tier is NVIDIA-only;
+`VK=1` on dsv4 was silently ignored before — #887/#894). Needs `libvulkan`
+headers at build time; the compiled `.spv` shaders are committed, so `glslc`
+is only needed to regenerate them (see `docs/vulkan.md` for the shared
+backend's requirements — Resizable BAR on discrete cards, `COLI_VK_SHADERS`).
+`VK=1` and `CUDA=1` are mutually exclusive (explicit Makefile error); `VK=0`
+builds are byte-identical to upstream.
+
+```bash
+cd c
+make deepseek-v4 VK=1       # + -DCOLI_VULKAN -DCOLI_V4_GPU_TIER -DCOLI_V4_GPU_TIER_VK, links -lvulkan
+```
+
+Runtime is opt-in too: `COLI_DSV4_VK_DENSE=1` engages the dense tier,
+`+COLI_DSV4_VK_EXPERTS=1` the fp4 routed-expert tier. A requested-but-
+unavailable tier warns loudly and runs CPU (never a silent ignore).
 
 ### Windows CUDA tier
 
@@ -274,6 +293,58 @@ card fails at launch with "no kernel image is available" rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
 | multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
+| Vulkan / `VK=1` + `COLI_DSV4_VK_DENSE=1` | any Vulkan 1.2+ GPU (developed on AMD RDNA2/gfx1030; Intel ARC works) | GPU dense (qkv/wo/route/head/shared/attn/mHC + compressor projections + batched mHC); expert bank under `COLI_CUDA_MOE_BATCH=1` | GPU dense + attention core + mHC + fp4 routed-expert mirrors (`COLI_DSV4_VK_EXPERTS=1`) |
+
+## Vulkan tier
+
+The dsv4 Vulkan tier (opt-in, `VK=1` build + `COLI_DSV4_VK_DENSE=1`) is the
+CUDA tier's structural twin: the engine's `COLI_V4_UNIT_GPU` glue talks to the
+linked backend through the same `dsv4_cuda_*` ABI, and
+`backend_vulkan_dsv4.c` implements that ABI over the shared Vulkan plumbing
+(the `backend_vulkan.c` GLM/K3 backend gains fmt=8 fp8-e4m3 and fmt=10 fp4
+branches; the CUDA tier stays NVIDIA-only). `COLI_V4_GPU_TIER_VK` selects the
+Vulkan header in the GPU unit; CUDA builds compile unchanged, `VK=1`+`CUDA=1`
+is a Makefile error. A new upstream `dsv4_cuda_*` call that the Vulkan backend
+hasn't implemented fails the VK=1 link loudly (rebase-fail-fast).
+
+**What runs where.** Dense: qkv (fused wq_a+wkv with one activation QDQ),
+grouped wo, route (bf16 gate + strict-greater top-6), head (bf16 argmax),
+shared experts, the dsv4 attention core (sigmoid sink + shared latent KV +
+window/compressed pools + inverse-RoPE over a persistent device KV ring),
+mHC pre/post (fn matvec on GPU, the sinkhorn chain host-side bitwise), and
+the prefill batch ops (compressor projections, batched mHC, batched
+attention). fp4 routed experts (M5): decode mirrors (LRU-recycled, bounded by
+free VRAM) + the prefill expert bank under `COLI_CUDA_MOE_BATCH=1`. The DSA
+indexer and the speculative-decode attention stay CPU (documented). Weights
+upload **byte-identical** (fp8 e4m3 raw + E8M0 128x128-block scales expanded
+to fp32 at upload; fp4 e2m1 + UE8M0 per-32-group with the e8-TABLE
+0xff→NaN semantics), so KVSAVE/prefix warm caches stay valid.
+
+**D7 dense-RAM handover.** After each layer's VRAM upload + fence, the
+resident fp8 RAM copy is freed (~7.3 GiB flows to the expert LRU cache — the
+measured capacity lever: decode roughly doubles at +8 GiB expert RAM). The
+fallback contract (D6): every op returns success/failure; any failure → CPU
+path. A post-drop failure reloads the dense set once (~1-3 s) and enters a
+permanent-CPU mode — a wedged GPU can slow a run, never corrupt it.
+
+**Honest parity envelope.** The shader matmuls are fp32/fp64-cross-block tree
+reductions vs the CPU's exact serial order, so the tier is **thresholded** —
+bitwise at the L2 per-op level (QDQ, bf16 rounding, the fp8 replica, fused
+phases), byte-identical greedy text within a verified generation length
+(≤16 tokens on the tested prompts; the fp64 cross-block fix moved the first
+borderline flip on the long-test prompt 18→21), and beyond that a borderline
+logit can flip — the same within-config-regression class as the CUDA tier.
+See TEST.md L3 and the L1/L2 harnesses for the exact contracts.
+
+**Measured (this host: i9-12900K, AMD RX 6900 XT/RDNA2, DeepSeek-V4-Flash-0731,
+cpuset 0-7 / OMP=8, 12 GiB expert RAM, greedy):** decode +25% (dense) / +50%
+(experts) per-token vs the CPU build, prefill −50% end-to-end on a 512-token
+prompt (bandwidth relief −37.5% + D7 capacity relief −20.7%), and vs upstream
+v1.9.0 on the same box: 1.7–1.9× decode (dense) / 2.3–2.7× (experts),
+1.5–2.3× end-to-end wall. GPU-side time is ~6-13% of decode wall (the rest
+is expert streaming from disk); the RAM-budget side is the bigger lever.
+Details + the full A/B tables: the M4-2/M4-3/M5-perf docs in the PR and the
+scripts/ harnesses (vk_parity.sh, vk_longgen_ab.py, vk_agentic_ab.py).
 
 ## Environment reference (V4 engine)
 
@@ -282,7 +353,12 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 **GPU tier**
 | var | meaning |
 |---|---|
-| `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
+| `DSV4_CUDA` (1) | master switch for the CUDA V4 GPU tier; `0` = CPU only |
+| `COLI_DSV4_VK_DENSE` (0) | master switch for the **Vulkan** V4 GPU tier (`VK=1` build): dense matmuls, attention core, mHC on the GPU + the D7 dense-RAM handover; `1` = engage, unset/`0` = CPU |
+| `COLI_DSV4_VK_EXPERTS` (0) | `1` = also run the fp4 routed-expert tier on Vulkan (decode mirrors + prefill bank under `COLI_CUDA_MOE_BATCH=1`); requires `COLI_DSV4_VK_DENSE=1` |
+| `COLI_DSV4_VK_DROP` (1) | free each layer's resident fp8 RAM after the VRAM upload + fence (D7 handover, ~7.3 GiB to the expert cache); `0` holds it (bandwidth-relief A/Bs) |
+| `COLI_DSV4_VK_OPS` (unset=all) | comma list of op groups to run on the GPU (`qkv,wo,route,head,shared,attn,mhc,comp,expert`); everything else falls back to CPU per-op |
+| `COLI_DSV4_VK_FAIL` (unset) | test-only fault injection: force a named op group to fail (L4 fallback suite) |
 | `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0) | `1` = GPU batched prefill attention block + GPU decode attention/indexer |

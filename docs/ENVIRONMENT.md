@@ -394,11 +394,29 @@ The V4 engine has its own knob set (~70 variables: GPU tier, prefill segments/
 chunks, prefix checkpoints, expert I/O, speculative decoding, profilers). It is
 documented with defaults in
 [deepseek-v4.md — Environment reference](deepseek-v4.md#environment-reference-v4-engine);
-the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
+the ones you are most likely to set: `DSV4_CUDA` (CUDA GPU tier on/off),
+`COLI_DSV4_VK_DENSE` (Vulkan GPU tier on/off — see below),
 `COLI_CUDA_ATTN_BATCH=1`, `COLI_CUDA_MOE_BATCH=1`, `DSV4_CUDA_EXPERT_MIRRORS`,
 `V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
 `COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
 usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
+
+**Vulkan tier (opt-in, `make VK=1`):** the dsv4 engine has a Vulkan compute
+tier for AMD/Intel GPUs (the CUDA tier is NVIDIA-only; `VK=1` on dsv4 was
+silently ignored before this — #887/#894). The resident fp8 dense set uploads
+byte-identical and computes on the GPU, the D7 handover frees ~7.3 GiB of RAM
+for the expert cache, and the fp4 routed-expert tier (decode mirrors + prefill
+bank) runs for `COLI_DSV4_VK_EXPERTS=1`. Every op falls back to CPU on
+failure; the fallback contract and the measured parity envelope are in
+[deepseek-v4.md](deepseek-v4.md#vulkan-tier) and [TEST.md](TEST.md).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_DSV4_VK_DENSE` | `0` (off) | Run the resident dense matmuls (qkv, wo, route, head, shared experts, attention core, mHC) on the Vulkan tier. Requires a `VK=1` build. A requested-but-unavailable tier warns loudly (no silent ignore). |
+| `COLI_DSV4_VK_EXPERTS` | `0` (off) | Also run the fp4 routed-expert tier on Vulkan: decode mirrors (LRU-recycled, bounded by free VRAM) + the prefill expert bank under `COLI_CUDA_MOE_BATCH=1`. Requires `COLI_DSV4_VK_DENSE=1`. |
+| `COLI_DSV4_VK_DROP` | `1` (on) | After a layer's VRAM upload + fence, free the resident fp8 RAM copy (the D7 handover — ~7.3 GiB flows to the expert LRU cache). `=0` holds the dense RAM (bandwidth-relief isolation for A/Bs). A post-drop GPU failure triggers one reload + permanent-CPU mode. |
+| `COLI_DSV4_VK_OPS` | unset (= all) | Comma list of op groups to run on the GPU (`qkv,wo,route,head,shared,attn,mhc,comp,expert`); anything else falls back to CPU per-op. Per-op isolation for A/Bs and debugging. |
+| `COLI_DSV4_VK_FAIL` | unset | Test-only fault injection: force a named op group to fail (L4 fallback suite). |
 
 | Variable | Default | Effect |
 |---|---|---|
