@@ -1,3 +1,10 @@
+A note - this colibri fork adds Vulkan support for Deepseek v4 Flash. It was written by Deepseek v4 Flash (Cloud-based) with multiple iterations, tests and prompts. It seems to work on my machine, so I thought I would share here as a vibecoded code example. Curious if its good enough for me to send a pull request - proffesional input welcome.
+
+Offloads experts and dense weights to VRAM. Runs with a 6800XT on my Machine, 16GB VRAM and 16GB (free) System RAM. Delivers up to a 50% improvement in my case, which makes sense given its main role is to leverage VRAM for holding weights and make the expert cache effectively larger.
+
+
+
+
 <p align="center">
   <img src="assets/colibri-logo.svg" width="560" alt="colibrì — tiny engine, immense model">
 </p>
