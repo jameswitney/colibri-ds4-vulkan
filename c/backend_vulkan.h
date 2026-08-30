@@ -157,6 +157,34 @@ size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 const void *coli_vk_tensor_wptr(const ColiVkTensor *t);
 const void *coli_vk_tensor_sptr(const ColiVkTensor *t);
 
+/* ---- dsv4 persistent device KV + cached sparse attention (M3b) ----
+ * Per-layer window ring (slot = position % window) + append-only compressed
+ * pool, both HOST_VISIBLE (plain memcpy appends; the queue submit makes them
+ * visible). The attention op reads them on-device: out[tokens][heads*dim] =
+ * the engine's CPU coli_v4_sparse_attention_ref semantics (sigmoid sink +
+ * window + compressed rows, bf16 probability + value, /den), with the
+ * current chunk's rows (absolute >= chunk_start) taken from the chunk buffer
+ * instead of the ring (the engine appends them only AFTER the call). The _idx
+ * variant reads the compressed rows through per-token selection ordinals.
+ * Return 1 on success, 0 on any failure/absence (caller falls back to CPU,
+ * D6). */
+int  coli_vk_dsv4_kv_ring_append(int layer, const float *rows, int start_pos,
+                                 int count, int window, int dim);
+int  coli_vk_dsv4_kv_comp_append(int layer, const float *rows, int start_idx,
+                                 int count, int dim);
+void coli_vk_dsv4_kv_free_all(void);
+int  coli_vk_dsv4_attn_cached(int layer, float *out, const float *q,
+                              const float *chunk, int chunk_start,
+                              const float *sinks, const int *meta, int abs_base,
+                              int comp_limit, int heads, int dim, int tokens,
+                              float scale);
+int  coli_vk_dsv4_attn_cached_idx(int layer, float *out, const float *q,
+                                  const float *chunk, int chunk_start,
+                                  const float *sinks, const int *meta,
+                                  const int *sel, int selstride, int abs_base,
+                                  int comp_limit, int heads, int dim, int tokens,
+                                  float scale);
+
 #ifdef __cplusplus
 }
 #endif

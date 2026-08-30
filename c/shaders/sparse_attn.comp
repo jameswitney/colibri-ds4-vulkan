@@ -1,0 +1,124 @@
+#version 450
+// dsv4 decode/prefill sparse attention over the persistent device KV (M3b).
+// One workgroup per (token, head): 256 threads = 8 warps. Mirrors the CUDA
+// sparse_attn_batch_cached_kernel / _idx_kernel (backend_cuda_dsv4.cu:776/843):
+//   score[item] = dot(qh, key[item]) * scale        (item over wn window rows
+//                                                    then cn compressed rows)
+//   m = max(score); den = exp(sink[h] - m) + sum exp(score - m)
+//   out[d] = bf16( sum_item bf16(exp(score-m)) * value[item][d] / den )
+// with the SAME row semantics the engine's CPU reference uses
+// (coli_v4_sparse_attention_ref): the window rows live in the per-layer ring
+// (slot = position % window) EXCEPT the current chunk's rows (absolute >=
+// chunk_start), which ride in a separate host buffer the engine appends to the
+// ring only AFTER the call (cache_advance). The compressed rows come from the
+// per-layer append-only pool; the _idx variant reads them through the
+// per-token selection ordinals (score order — same order the CPU accumulates,
+// keeping the fp32 value sums bitwise identical to the CPU loop).
+//
+// The per-item score accumulation is fp32 tree/warp order (thresholded vs the
+// CPU's sequential loop); the value accumulation iterates items in the CPU's
+// order, so the value sums match the CPU reference at fp32 noise.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Q  { float q[]; };     // [tokens][heads*dim]
+layout(std430, binding = 1) readonly buffer Win { float win[]; };  // ring [window*dim]
+layout(std430, binding = 2) readonly buffer Ck  { float ck[]; };   // chunk [tokens*dim]
+layout(std430, binding = 3) readonly buffer Cp  { float cp[]; };   // pool [comp_limit*dim]
+layout(std430, binding = 4) readonly buffer Sn  { float sn[]; };   // sinks [heads]
+layout(std430, binding = 5) readonly buffer Mt  { int mt[]; };     // meta [3*tokens]
+layout(std430, binding = 6) readonly buffer Sl  { int sl[]; };     // sel [tokens*selstride]
+layout(std430, binding = 7) writeonly buffer O  { float o[]; };    // [tokens][heads*dim]
+
+layout(push_constant) uniform P {
+    int heads, dim, window, chunk_start;
+    int abs_base, comp_limit, tokens, has_sel;
+    int selstride, pad;
+    float scale;
+} pc;
+
+// Real dsv4 decode: window 128 + compressed <= 8192 -> total <= 8320. The
+// 12288 budget also covers a 4096-row window + 8192 compressed (48 KB shared,
+// under RDNA2's 64 KB workgroup LDS; the query stages separately).
+const int MAX_TOTAL = 12288;
+shared float scores[MAX_TOTAL];
+shared float qsh[512];
+shared float den_shared;
+
+float bf16r(float x) {
+    uint u = floatBitsToUint(x);
+    return uintBitsToFloat((u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
+}
+
+// Window row at absolute position ap (ring slot = ap % window), or the chunk
+// row for ap >= chunk_start (the current batch's rows not yet appended).
+float rowval(int ap, int d, int base) {
+    if (ap >= pc.chunk_start) return ck[base + (ap - pc.chunk_start) * pc.dim + d];
+    return win[(ap % pc.window) * pc.dim + d];
+}
+
+void main() {
+    int t = int(gl_WorkGroupID.x);
+    int h = int(gl_WorkGroupID.y);
+    if (t >= pc.tokens || h >= pc.heads) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int wo = mt[3 * t];
+    int wn = mt[3 * t + 1];
+    int cn = mt[3 * t + 2];
+    int total = wn + cn;
+    if (total < 1 || total > MAX_TOTAL || pc.dim > 512) return;
+
+    const int qbase = (t * pc.heads + h) * pc.dim;
+    for (int d = tid; d < pc.dim; d += 256) qsh[d] = q[qbase + d];
+    barrier();
+
+    // ---- score pass: one subgroup per item, lane-stride dot over dim ----
+    int sg     = int(gl_SubgroupID);
+    int lane   = int(gl_SubgroupInvocationID);
+    int sgsize = int(gl_SubgroupSize);
+    int nsg    = 256 / sgsize;
+    for (int item = sg; item < total; item += nsg) {
+        float z = 0.0;
+        if (item < wn) {
+            int ap = pc.abs_base + wo + item;
+            for (int d = lane; d < pc.dim; d += sgsize)
+                z += qsh[d] * rowval(ap, d, 0);
+        } else {
+            int ci = pc.has_sel != 0 ? sl[t * pc.selstride + (item - wn)] : (item - wn);
+            for (int d = lane; d < pc.dim; d += sgsize)
+                z += qsh[d] * cp[ci * pc.dim + d];
+        }
+        z = subgroupAdd(z);
+        if (lane == 0) scores[item] = z * pc.scale;
+    }
+    barrier();
+
+    // ---- softmax + bf16 probability (thread 0, then barrier) ----
+    if (tid == 0) {
+        float m = -1.0 / 0.0;
+        for (int i = 0; i < total; i++) m = max(m, scores[i]);
+        float den = exp(sn[h] - m);
+        for (int i = 0; i < total; i++) {
+            float a = exp(scores[i] - m);
+            den += a;
+            scores[i] = bf16r(a);
+        }
+        den_shared = den;
+    }
+    barrier();
+
+    // ---- value pass: threads over dim, items in CPU order ----
+    float den = den_shared;
+    for (int d = tid; d < pc.dim; d += 256) {
+        float sum = 0.0;
+        for (int item = 0; item < wn; item++) {
+            int ap = pc.abs_base + wo + item;
+            sum += scores[item] * rowval(ap, d, 0);
+        }
+        for (int item = 0; item < cn; item++) {
+            int ci = pc.has_sel != 0 ? sl[t * pc.selstride + item] : item;
+            sum += scores[wn + item] * cp[ci * pc.dim + d];
+        }
+        o[qbase + d] = bf16r(sum / den);
+    }
+}

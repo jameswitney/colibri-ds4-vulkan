@@ -63,7 +63,8 @@ typedef struct Dsv4CudaTensor {
  * compare against the all-CPU run). The groups mirror the M3a op surface:
  * qkv (wq_a/wq_b/wkv matvecs), wo (wo_a grouped + wo_b), route (ffn gate
  * logits + top-6), head (head.weight bf16 matvec + argmax), shared
- * (ffn.shared_experts.w1/w2/w3 fp8 matvecs). */
+ * (ffn.shared_experts.w1/w2/w3 fp8 matvecs), attn (the decode attention
+ * core over the device KV ring). */
 typedef enum {
     DS4VK_OP_NONE = 0,
     DS4VK_OP_QKV,
@@ -71,6 +72,7 @@ typedef enum {
     DS4VK_OP_ROUTE,
     DS4VK_OP_HEAD,
     DS4VK_OP_SHARED,
+    DS4VK_OP_ATTN,
     DS4VK_OP_COUNT
 } Ds4vkOp;
 
@@ -81,6 +83,7 @@ static const char *ds4vk_op_name(Ds4vkOp op) {
     case DS4VK_OP_ROUTE: return "route";
     case DS4VK_OP_HEAD: return "head";
     case DS4VK_OP_SHARED: return "shared";
+    case DS4VK_OP_ATTN: return "attn";
     default: return "none";
     }
 }
@@ -130,6 +133,14 @@ static int ds4vk_op_enabled(const Dsv4CudaTensor *t) {
     int mask = ds4vk_op_mask();
     if (mask < 0) return t->op != DS4VK_OP_NONE;
     return t->op != DS4VK_OP_NONE && ((mask >> t->op) & 1);
+}
+
+/* The attention core has no per-tensor handle (it runs over the device KV
+ * ring) — gate its group directly. */
+static int ds4vk_op_enabled_g(void) {
+    int mask = ds4vk_op_mask();
+    if (mask < 0) return 1;
+    return (mask >> DS4VK_OP_ATTN) & 1;
 }
 
 /* ---- per-op wall timing (VK_PROF=1, the backend's own gate) ---- */
@@ -797,10 +808,23 @@ int dsv4_cuda_sparse_attn_batch_cached(int device, int layer, const float *q,
                                        int abs_base, int comp_limit, int heads,
                                        int dim, int tokens, float scale,
                                        float *out) {
-    (void)device; (void)layer; (void)q; (void)chunk; (void)chunk_start;
-    (void)sinks; (void)meta; (void)abs_base; (void)comp_limit; (void)heads;
-    (void)dim; (void)tokens; (void)scale; (void)out;
-    return 0;
+    /* M3b: the decode attention core — sigmoid sink + window ring + compressed
+     * pool + bf16 probability/value (sparse_attn.comp), the same math as the
+     * engine's coli_v4_sparse_attention_ref. Gated per-op like the matvecs
+     * (COLI_DSV4_VK_OPS=attn); any failure -> the engine's CPU attention runs
+     * (D6, the block at deepseek_v4.c:2151 falls through to the reference). */
+    (void)device;
+    if (!ds4vk_op_enabled_g()) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    int ok = coli_vk_dsv4_attn_cached(
+        layer, out, q, chunk, chunk_start, sinks, meta, abs_base,
+        comp_limit, heads, dim, tokens, scale);
+    if (ok) {
+        Dsv4CudaTensor fake; memset(&fake, 0, sizeof(fake)); fake.op = DS4VK_OP_ATTN;
+        ds4vk_prof_tick(&fake, t0);
+    }
+    return ok;
 }
 
 int dsv4_cuda_sparse_attn_batch_cached_idx(int device, int layer,
@@ -810,11 +834,18 @@ int dsv4_cuda_sparse_attn_batch_cached_idx(int device, int layer,
                                            int selstride, int abs_base,
                                            int comp_limit, int heads, int dim,
                                            int tokens, float scale, float *out) {
-    (void)device; (void)layer; (void)q; (void)chunk; (void)chunk_start;
-    (void)sinks; (void)meta; (void)sel; (void)selstride; (void)abs_base;
-    (void)comp_limit; (void)heads; (void)dim; (void)tokens; (void)scale;
-    (void)out;
-    return 0;
+    (void)device;
+    if (!ds4vk_op_enabled_g()) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    int ok = coli_vk_dsv4_attn_cached_idx(
+        layer, out, q, chunk, chunk_start, sinks, meta, sel, selstride,
+        abs_base, comp_limit, heads, dim, tokens, scale);
+    if (ok) {
+        Dsv4CudaTensor fake; memset(&fake, 0, sizeof(fake)); fake.op = DS4VK_OP_ATTN;
+        ds4vk_prof_tick(&fake, t0);
+    }
+    return ok;
 }
 
 int dsv4_cuda_indexer_score_batch(int device, const float *queries,
@@ -836,16 +867,17 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows,
                              int start_pos, int count, int window, int dim) {
-    (void)device; (void)layer; (void)rows; (void)start_pos; (void)count;
-    (void)window; (void)dim;
-    return 0;
+    /* M3b: the per-layer device window ring (slot = position % window),
+     * seeded/appended by the engine's coli_v4_gpu_kv_cache_sync/advance. */
+    (void)device;
+    return coli_vk_dsv4_kv_ring_append(layer, rows, start_pos, count, window, dim);
 }
 
 int dsv4_cuda_kv_comp_append(int device, int layer, const float *rows,
                              int start_idx, int count, int dim) {
-    (void)device; (void)layer; (void)rows; (void)start_idx; (void)count;
-    (void)dim;
-    return 0;
+    /* M3b: the per-layer append-only compressed pool (grown on demand). */
+    (void)device;
+    return coli_vk_dsv4_kv_comp_append(layer, rows, start_idx, count, dim);
 }
 
 int dsv4_cuda_mhc_pre(const Dsv4CudaActivation *residual, Dsv4CudaTensor *fn,

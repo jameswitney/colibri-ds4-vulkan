@@ -72,6 +72,12 @@ static struct {
      * coli_fp8_activation_qdq_ref (M2-2; qdq.spv optional, absent -> CPU path) */
     VkShaderModule shader_qdq; VkDescriptorSetLayout dsl_qdq; VkPipelineLayout plyt_qdq;
     VkPipeline pipe_qdq; VkDescriptorPool dpool_qdq; VkDescriptorSet dset_qdq;
+    /* dsv4 sparse attention over the persistent device KV (M3b; 8 bindings:
+     * q, win ring, chunk, comp pool, sinks, meta, sel, out). sparse_attn.spv
+     * optional — absent -> the decode path stays on the CPU attention (D6). */
+    VkShaderModule shader_ds4; VkDescriptorSetLayout dsl_ds4; VkPipelineLayout plyt_ds4;
+    VkPipeline pipe_ds4; VkDescriptorPool dpool_ds4; VkDescriptorSet dset_ds4;
+    Scratch ds4_in;              /* per-call inputs: q | chunk | sinks | meta | sel (readback in G.y) */
     VkCommandPool cpool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -118,6 +124,13 @@ static struct {
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 struct PCQdq { int S, I, block; };   /* push constants of the fp8 activation QDQ shader (qdq.comp) */
+/* push constants of the dsv4 sparse-attention shader (sparse_attn.comp) */
+struct PCDs4Attn {
+    int heads, dim, window, chunk_start;
+    int abs_base, comp_limit, tokens, has_sel;
+    int selstride, pad;
+    float scale;
+};
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
@@ -521,6 +534,16 @@ int coli_vk_init(const char *spv_path) {
             return 0;
     }
 
+    /* Optional dsv4 sparse attention pipeline (M3b): 8 bindings (q, win,
+     * chunk, comp, sinks, meta, sel, out), push constants struct PCDs4Attn.
+     * Absent -> the decode path stays on the CPU attention (D6). */
+    char ds4_path[512]; derive_dir_file(spv_path, "sparse_attn.spv", ds4_path, sizeof(ds4_path));
+    G.shader_ds4 = load_spv(G.dev, ds4_path);
+    if (G.shader_ds4) {
+        if (!build_pipeline(G.dev, 8, sizeof(struct PCDs4Attn), G.shader_ds4, &G.dsl_ds4, &G.plyt_ds4, &G.pipe_ds4, &G.dpool_ds4, &G.dset_ds4))
+            return 0;
+    }
+
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
     VKCHECK(vkCreateCommandPool(G.dev, &cpci, NULL, &G.cpool), "cmdPool");
@@ -831,6 +854,206 @@ int coli_vk_activation_qdq(float *y, uint8_t *scales, const float *x,
         scales[i] = (uint8_t)(((uint32_t *)G.qdqs.ptr)[i] & 0xffu);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer was clobbered */
     return 1;
+}
+
+/* ---- dsv4 persistent device KV + cached sparse attention (M3b) ----
+ * The decode path (deepseek_v4.c attention_token_impl, COLI_V4_GPU_TIER block)
+ * appends each attended row to the per-layer ring (slot = position % window)
+ * and the compressor's rows to the per-layer append-only pool; the attention
+ * op then reads both on-device — only q/chunk/sinks/meta(+sel) cross the
+ * boundary per call, mirroring dsv4_cuda_sparse_attn_batch_cached(_idx). The
+ * buffers are HOST_VISIBLE (writes are plain memcpy; the queue submit makes
+ * them visible to the shader, same pattern as the weight arenas). Any failure
+ * returns 0 and the engine falls back to the CPU attention (D6). */
+#define DS4VK_KV_LAYERS 64
+#define DS4VK_ATTN_MAX_TOTAL 12288   /* window 128 + comp 8192 = 8320; 48 KB LDS budget */
+typedef struct {
+    VkBuffer buf; VkDeviceMemory mem; float *host;
+    int rows, dim;   /* capacity (ring: window; pool: grown cap) */
+} Ds4vkKv;
+static Ds4vkKv g_ds4_ring[DS4VK_KV_LAYERS];
+static Ds4vkKv g_ds4_comp[DS4VK_KV_LAYERS];
+
+static void ds4vk_kv_free(Ds4vkKv *k) {
+    if (!k) return;
+    if (k->buf && G.ready) { vkDestroyBuffer(G.dev, k->buf, NULL); k->buf = VK_NULL_HANDLE; }
+    if (k->mem) { vkFreeMemory(G.dev, k->mem, NULL); k->mem = VK_NULL_HANDLE; }
+    k->host = NULL; k->rows = 0; k->dim = 0;
+}
+
+static int ds4vk_kv_alloc(Ds4vkKv *k, size_t floats) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = floats * 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(G.dev, &bi, NULL, &k->buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, k->buf, &req);
+    uint32_t tries[2]; int ntries = 0;
+    if (req.memoryTypeBits & (1u << G.memtype)) tries[ntries++] = G.memtype;
+    if (G.memtype_sys != G.memtype && (req.memoryTypeBits & (1u << G.memtype_sys)))
+        tries[ntries++] = G.memtype_sys;
+    for (int i = 0; i < ntries; i++) {
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = floats * 4, .memoryTypeIndex = tries[i]};
+        if (vkAllocateMemory(G.dev, &ai, NULL, &k->mem) == VK_SUCCESS &&
+            vkMapMemory(G.dev, k->mem, 0, floats * 4, 0, (void **)&k->host) == VK_SUCCESS &&
+            vkBindBufferMemory(G.dev, k->buf, k->mem, 0) == VK_SUCCESS) {
+            k->rows = (int)floats;
+            return 1;
+        }
+        if (k->mem) { vkFreeMemory(G.dev, k->mem, NULL); k->mem = VK_NULL_HANDLE; }
+    }
+    vkDestroyBuffer(G.dev, k->buf, NULL); k->buf = VK_NULL_HANDLE;
+    return 0;
+}
+
+int coli_vk_dsv4_kv_ring_append(int layer, const float *rows, int start_pos,
+                                int count, int window, int dim) {
+    if (!G.ready || layer < 0 || layer >= DS4VK_KV_LAYERS || !rows || start_pos < 0 ||
+        count < 1 || window < 1 || dim < 1)
+        return 0;
+    Ds4vkKv *k = &g_ds4_ring[layer];
+    if (k->buf && k->rows != window) ds4vk_kv_free(k);
+    if (!k->buf && !ds4vk_kv_alloc(k, (size_t)window * dim)) return 0;
+    k->rows = window; k->dim = dim;
+    int done = 0;
+    while (done < count) {   /* the ring wraps: slot = (start_pos+done) % window */
+        int slot = (start_pos + done) % window;
+        int run = count - done;
+        if (run > window - slot) run = window - slot;
+        memcpy(k->host + (size_t)slot * dim, rows + (size_t)done * dim,
+               (size_t)run * dim * sizeof(float));
+        done += run;
+    }
+    return 1;
+}
+
+int coli_vk_dsv4_kv_comp_append(int layer, const float *rows, int start_idx,
+                                int count, int dim) {
+    if (!G.ready || layer < 0 || layer >= DS4VK_KV_LAYERS || !rows || start_idx < 0 ||
+        count < 1 || dim < 1)
+        return 0;
+    Ds4vkKv *k = &g_ds4_comp[layer];
+    int need = start_idx + count;
+    if (k->rows < need) {
+        int cap = k->rows ? k->rows : 512;
+        while (cap < need) cap *= 2;
+        Ds4vkKv grown = {0};
+        if (!ds4vk_kv_alloc(&grown, (size_t)cap * dim)) return 0;
+        if (k->rows > 0 && start_idx > 0)
+            memcpy(grown.host, k->host, (size_t)start_idx * dim * sizeof(float));
+        ds4vk_kv_free(k);
+        *k = grown;
+        k->rows = cap;
+    }
+    k->dim = dim;
+    memcpy(k->host + (size_t)start_idx * dim, rows, (size_t)count * dim * sizeof(float));
+    return 1;
+}
+
+void coli_vk_dsv4_kv_free_all(void) {
+    for (int i = 0; i < DS4VK_KV_LAYERS; i++) {
+        ds4vk_kv_free(&g_ds4_ring[i]);
+        ds4vk_kv_free(&g_ds4_comp[i]);
+    }
+}
+
+static int ds4vk_attn_common(int layer, float *out, const float *q,
+                             const float *chunk, int chunk_start,
+                             const float *sinks, const int *meta, int abs_base,
+                             int comp_limit, int heads, int dim, int tokens,
+                             float scale, const int *sel, int selstride) {
+    if (!G.ready || !G.shader_ds4 || layer < 0 || layer >= DS4VK_KV_LAYERS ||
+        !q || !chunk || !sinks || !meta || !out || abs_base < 0 || chunk_start < 0 ||
+        heads < 1 || dim < 1 || tokens < 1 || dim > 512 || !(scale > 0.f))
+        return 0;
+    Ds4vkKv *ring = &g_ds4_ring[layer], *comp = &g_ds4_comp[layer];
+    if (!ring->buf || ring->rows < 1 ||
+        (comp_limit > 0 && (!comp->buf || comp->rows < comp_limit)))
+        return 0;
+    int window = ring->rows, max_total = 0;
+    for (int t = 0; t < tokens; t++) {
+        int wo = meta[3 * t], wn = meta[3 * t + 1], cn = meta[3 * t + 2], tt = wn + cn;
+        if (wo < 0 || wn < 1 || wn > window || cn < 0 || cn > comp_limit) return 0;
+        if (abs_base + wo + wn > chunk_start + tokens) return 0;
+        if (tt > max_total) max_total = tt;
+    }
+    if (max_total < 1 || max_total > DS4VK_ATTN_MAX_TOTAL) return 0;
+    size_t qb = (size_t)tokens * heads * dim * sizeof(float);
+    size_t cb = (size_t)tokens * dim * sizeof(float);
+    size_t sb = (size_t)heads * sizeof(float);
+    size_t mb = (size_t)tokens * 3 * sizeof(int);
+    size_t ib = sel ? (size_t)tokens * selstride * sizeof(int) : 0;
+    size_t yb = qb;
+    if (!scratch_reserve(&G.ds4_in, qb + cb + sb + mb + ib) ||
+        !scratch_reserve_mt(&G.y, yb, G.memtype_cached))
+        return 0;
+    uint8_t *in = G.ds4_in.ptr;
+    memcpy(in, q, qb);
+    memcpy(in + qb, chunk, cb);
+    memcpy(in + qb + cb, sinks, sb);
+    memcpy(in + qb + cb + sb, meta, mb);
+    if (sel) memcpy(in + qb + cb + sb + mb, sel, ib);
+
+    VkDescriptorBufferInfo bi[8] = {
+        {.buffer = G.ds4_in.buf, .offset = 0, .range = qb},
+        {.buffer = ring->buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.ds4_in.buf, .offset = qb, .range = cb},
+        {.buffer = comp->buf ? comp->buf : G.ds4_in.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.ds4_in.buf, .offset = qb + cb, .range = sb},
+        {.buffer = G.ds4_in.buf, .offset = qb + cb + sb, .range = mb},
+        {.buffer = G.ds4_in.buf, .offset = qb + cb + sb + mb, .range = ib > 0 ? ib : 4},
+        {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[8];
+    for (int i = 0; i < 8; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_ds4,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 8, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ds4);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ds4, 0, 1, &G.dset_ds4, 0, NULL);
+    struct PCDs4Attn pc = {heads, dim, window, chunk_start, abs_base, comp_limit,
+                           tokens, sel ? 1 : 0, selstride, 0, scale};
+    vkCmdPushConstants(G.cmd, G.plyt_ds4, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)tokens, (uint32_t)heads, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] dsv4 attention fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    memcpy(out, G.y.ptr, yb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer was clobbered */
+    return 1;
+}
+
+int coli_vk_dsv4_attn_cached(int layer, float *out, const float *q,
+                             const float *chunk, int chunk_start,
+                             const float *sinks, const int *meta, int abs_base,
+                             int comp_limit, int heads, int dim, int tokens,
+                             float scale) {
+    return ds4vk_attn_common(layer, out, q, chunk, chunk_start, sinks, meta,
+                             abs_base, comp_limit, heads, dim, tokens, scale,
+                             NULL, 0);
+}
+
+int coli_vk_dsv4_attn_cached_idx(int layer, float *out, const float *q,
+                                 const float *chunk, int chunk_start,
+                                 const float *sinks, const int *meta,
+                                 const int *sel, int selstride, int abs_base,
+                                 int comp_limit, int heads, int dim, int tokens,
+                                 float scale) {
+    return ds4vk_attn_common(layer, out, q, chunk, chunk_start, sinks, meta,
+                             abs_base, comp_limit, heads, dim, tokens, scale,
+                             sel, selstride);
 }
 
 /* Fused first half of the expert MLP: hidden = silu(gate(x)) * up(x), computed in ONE
@@ -1768,6 +1991,14 @@ void coli_vk_shutdown(void) {
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_qdq, NULL);
         vkDestroyShaderModule(G.dev, G.shader_qdq, NULL);
     }
+    if (G.shader_ds4) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_ds4, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_ds4, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_ds4, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_ds4, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_ds4, NULL);
+    }
+    coli_vk_dsv4_kv_free_all();   /* M3b persistent KV buffers (device memory) */
     for (VkWArena *a = g_warena; a;) {   /* weight arenas: unmapped/freed with the device */
         VkWArena *nx = a->next;
         vkUnmapMemory(G.dev, a->mem); vkFreeMemory(G.dev, a->mem, NULL);

@@ -225,7 +225,7 @@ endif
 CFLAGS   += -DCOLI_VULKAN -DCOLI_V4_GPU_TIER -DCOLI_V4_GPU_TIER_VK
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o backend_vulkan_dsv4.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/qdq.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/qdq.spv shaders/sparse_attn.spv
 V4_WIN_EXTRA_OBJS += $(VK_OBJ)
 endif
 
@@ -347,6 +347,23 @@ test-vk-dsv4-ops: shaders/qmatmul.spv shaders/qdq.spv $(VK_OPS_ORACLE_OBJS)
 	$(CC) -O2 -I. tests/test_dsv4_vk_ops.c backend_vulkan.c backend_vulkan_dsv4.c \
 		$(VK_OPS_ORACLE_OBJS) -o tests/test_dsv4_vk_ops -lvulkan -lm -fopenmp -pthread -Wl,--gc-sections
 	./tests/test_dsv4_vk_ops
+endif
+
+# L2 attention core parity (TEST.md §2 L2 / M3b): the cached sparse attention
+# (window ring + compressed pool + sigmoid sink, plain and indexed variants +
+# ring wrap) vs the REAL engine CPU function — the COLI_V4_UNIT_SPARSE_ATTENTION
+# unit linked without the GPU-tier defines (pure-CPU reference, gc-sections).
+.PHONY: test-vk-dsv4-attn
+ifeq ($(VK),1)
+VK_ATTN_ORACLE_OBJ = tests/.vk_attn_oracle.o
+tests/.vk_attn_oracle.o: deepseek_v4.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections \
+		-UCOLI_V4_GPU_TIER -UCOLI_V4_GPU_TIER_VK -UCOLI_VULKAN \
+		-DCOLI_V4_UNIT_SPARSE_ATTENTION -c deepseek_v4.c -o $@
+test-vk-dsv4-attn: shaders/qmatmul.spv shaders/sparse_attn.spv $(VK_ATTN_ORACLE_OBJ) tests/.vk_ops_oracle_nq.o
+	$(CC) -O2 -I. tests/test_dsv4_sparse_attn_vk.c backend_vulkan.c backend_vulkan_dsv4.c \
+		$(VK_ATTN_ORACLE_OBJ) tests/.vk_ops_oracle_nq.o -o tests/test_dsv4_sparse_attn_vk -lvulkan -lm -fopenmp -pthread -Wl,--gc-sections
+	./tests/test_dsv4_sparse_attn_vk
 endif
 
 # dsv4 Vulkan op surface (M1-3 seam): same-named dsv4_cuda_* ABI over the

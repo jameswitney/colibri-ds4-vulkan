@@ -11089,6 +11089,16 @@ int coli_v4_gpu_attn_batch_wanted(void) {
     if (wanted < 0) {
         const char *setting = getenv("COLI_CUDA_ATTN_BATCH");
         wanted = setting && atoi(setting) != 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+        /* M3b-1: the VK tier runs the DECODE attention on the GPU whenever the
+         * dense tier is requested (COLI_DSV4_VK_DENSE=1 / COLI_VULKAN=1) — the
+         * same persistent-KV + sparse-attention machinery the CUDA batch path
+         * uses. The other consumers of this flag are safe in the VK build:
+         * the prefill/batch consumers (compressor projections, batched
+         * attention, mHC) still fail -> CPU fallback (M4), and wo_a's fmt=9
+         * upload lands in the same fmt-8 storage (numerics unchanged, M3a). */
+        if (!wanted && v4_gpu_wanted()) wanted = 1;
+#endif
     }
     return wanted;
 }
