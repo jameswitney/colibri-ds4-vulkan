@@ -31,6 +31,26 @@ void coli_vk_mem_info(size_t *used_bytes, size_t *tensor_count);
 void coli_vk_alloc_priority(float p);
 int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
 
+/* fmt=8 (dsv4 fp8-e4m3) UE8M0 block-scale helpers. The dsv4 resident dense set
+ * ships 1-byte UE8M0 (power-of-two) block scales (128x128 blocks); the shader
+ * consumes fp32, so upload_tensor expands the codes to fp32 at upload via
+ * coli_vk_expand_e8m0 (PLAN D4). The expansion is bitwise-equal to the CPU
+ * decoder (deepseek_v4.c coli_e8m0_decode: 0xff -> NaN, else 2^(value-127)) —
+ * TEST L1 pins this bitwise. The dsv4 backend (backend_vulkan_dsv4.c) passes
+ * raw UE8M0 bytes cast to const float* — the same shape as the dsv4_cuda_upload_fp8
+ * ABI it implements. */
+float coli_vk_e8m0_expand(uint8_t value);
+int   coli_vk_expand_e8m0(const uint8_t *src, float *dst, size_t n);
+
+/* dsv4 fp8 activation QDQ (M2-2): bitwise-equal to the CPU reference
+ * coli_fp8_activation_qdq_ref. y[S*I] dequantized activations (E4M3FN RNE
+ * round + per-block UE8M0 scale folded in), scales[S*ceil(I/block)] UE8M0
+ * codes. block in [1,128] (dense qkv path: 128; MLA nope path: 64). The _pre
+ * hoist contract: one call feeds both wq_a and wkv (shared input). Returns 1,
+ * or 0 when unavailable (no qdq.spv / no device) — caller falls back to CPU. */
+int coli_vk_activation_qdq(float *y, uint8_t *scales, const float *x,
+                           int S, int I, int block);
+
 /* y[S,O] = (x[S,I] @ dequant(W[O,I])^T) * scale[O].
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.

@@ -1,33 +1,38 @@
-/* backend_vulkan_dsv4.c — dsv4 Vulkan op surface: M1-3 seam spike stub.
+/* backend_vulkan_dsv4.c — dsv4 Vulkan op surface.
  *
- * Implements the full `dsv4_cuda_*` ABI (backend_cuda_dsv4.h) with stub
- * bodies so the VK=1 build can define COLI_V4_GPU_TIER and compile the whole
- * engine GPU seam (COLI_V4_UNIT_GPU glue + the BLOCK_HYBRID externs) against
- * a backend that needs no ICD. Contract, per the mechanism decision in
- * backend_vulkan_dsv4.h:
+ * Implements the full `dsv4_cuda_*` ABI (backend_cuda_dsv4.h) over the shared
+ * GLM Vulkan plumbing (backend_vulkan.c). Mechanism (backend_vulkan_dsv4.h):
  *
- *   - init / arch-ok / name succeed  -> the seam runs end-to-end at runtime;
- *   - uploads succeed and are logged -> REVIEW G7 dense-set inventory (the
- *     engine's per-layer plan dump in coli_v4_gpu_layer_upload adds names);
- *     the handle carries real byte accounting (dsv4_cuda_tensor_bytes) so the
- *     uploaded-MiB numbers are truthful;
- *   - every compute op returns failure -> the engine's per-op dispatch falls
- *     back to the CPU reference (D6), so output is token-for-token identical
- *     to a pure-CPU run. The fp4 expert upload fails too, which keeps the
- *     expert mirrors NULL and the hybrid MoE block unreachable at runtime
- *     (its failure path is token-fatal upstream, not a D6 fallback — noted
- *     for the M3 expert work).
- *
- * The real Vulkan ops land in M2 (fmt=8 matmul primitive) and M3 (decode
- * path); at that point the bodies below are replaced by ds4vk_* calls over
- * the GLM backend (backend_vulkan.c). Nothing here links libvulkan.
+ *   - M2-3: real backend init + REAL dense-set uploads. dsv4_cuda_init brings
+ *     up the Vulkan device and committed shaders; the fp8 uploads
+ *     (dsv4_cuda_upload_fp8 / _bf16) copy the resident dense weights into the
+ *     backend's host-visible arenas (fmt=8: raw e4m3 bytes, UE8M0 codes
+ *     expanded to fp32 at upload, PLAN D4) via coli_vk_tensor_ensure. The
+ *     handles carry a ColiVkTensor* that the M3a compute ops will drive.
+ *     The engine's per-layer plan dump (coli_v4_gpu_layer_upload) still logs
+ *     the G7 inventory names; this backend logs the real bytes + device.
+ *   - Budget + ReBAR (PLAN M2-3): dsv4_cuda_mem_free_mb reports real free
+ *     VRAM from VK_EXT_memory_budget; the backend's arena falls back to
+ *     system-RAM host-visible memory when the Resizable-BAR window is
+ *     exhausted (256 MB on this host), so the ~5.5 GiB dense set still
+ *     uploads on a ReBAR-disabled card (correct, slower reads over PCIe).
+ *   - bf16/f32 uploads deliberately fail (log "deferred"): their consumers
+ *     (route, mHC, head argmax, batched attention) are M3a/M3c/M4 ops; the
+ *     tensors stay CPU-only in v1, exactly like the fp4 expert mirrors (M5).
+ *   - every compute op still returns failure -> the engine's per-op dispatch
+ *     falls back to the CPU reference (D6), so output is token-for-token
+ *     identical to a pure-CPU run. M3a replaces the matmul-family bodies.
  */
 #include "backend_vulkan_dsv4.h"
+#include "backend_vulkan.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ---- opaque handle definitions (ABI types are forward-declared in the
  *      header; the engine only passes these pointers around) ---- */
@@ -36,8 +41,8 @@ typedef struct Dsv4CudaTensor {
     int device;
     long long bytes;   /* uploaded weight bytes (real accounting) */
     int fmt;           /* 8=fp8-e4m3, 9=fp8-bf16-rounded, 4=fp4, 16=bf16, 32=f32 */
-    char name[64];     /* empty in the stub: the engine names uploads, not the
-                          backend; the G7 name comes from the engine dump */
+    int O, I;
+    ColiVkTensor *vk;  /* the arena handle (M2-3: real uploads; M3a compute) */
 } Dsv4CudaTensor;
 
 typedef struct Dsv4CudaActivation {
@@ -68,14 +73,74 @@ static const char *stub_fmt_name(int fmt) {
     }
 }
 
-static Dsv4CudaTensor *stub_tensor(int device, long long bytes, int fmt) {
-    Dsv4CudaTensor *t = calloc(1, sizeof(*t));
-    if (!t) return NULL;
-    t->device = device;
-    t->bytes = bytes;
-    t->fmt = fmt;
-    return t;
+/* ---- fp8 exactness replica (TEST L1 bitwise oracle, M2-4) -----------------
+ * ds4vk_fp8_ref_matmul is a serial-order C mirror of the CUDA
+ * dsv4_cuda_fp8_ref_matmul kernels (backend_cuda_dsv4.cu:982/1004): the
+ * row-major path accumulates fp32 SEQUENTIALLY within each 128-block
+ * (__fadd_rn/__fmul_rn, no FMA) and fp64 across blocks (__dadd_rn/__dmul_rn,
+ * __double2float_rn at the end); the rows8-packed path accumulates
+ * (x*v)*scale fp32 sequentially over ALL columns. Both are exactly the CUDA
+ * source semantics, so the replica is the BITWISE reference for the
+ * production shader (which is fp32 tree-order, thresholded against it) and a
+ * bitwise cross-check against the engine's own CPU kernels (the AVX2 rows8
+ * compute uses the same (x*v)*scale order). fp-contract is disabled so a*b+c
+ * never fuses into FMA (CUDA's __fadd_rn/__fmul_rn are explicitly unfused). */
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+static float ds4vk_e4m3(uint8_t b) {   /* mirror of e4m3() / coli_e4m3fn_decode */
+    int sign = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    float v;
+    if (!e) v = ldexpf((float)m, -9);
+    else if (e == 15) v = m == 7 ? NAN : ldexpf(1.f + m / 8.f, 8);
+    else v = ldexpf(1.f + m / 8.f, e - 7);
+    return sign ? -v : v;
 }
+int ds4vk_fp8_ref_matmul(const uint8_t *w, const float *bscale,
+                         int rows, int cols, int packed_rows8,
+                         const float *x, int tokens, float *y) {
+    if (!w || !bscale || !x || !y || rows < 1 || cols < 1 || cols % 128 ||
+        tokens < 1 || (packed_rows8 && rows % 8)) return 0;
+    if (packed_rows8) {
+        int nblk = cols / 128;
+        for (int t = 0; t < tokens; t++) {
+            const float *xs = x + (long long)t * cols;
+            for (int o = 0; o < rows; o++) {
+                const float *scl = bscale + (long long)(o / 128) * nblk;
+                long long tile = o >> 3; int r = o & 7;
+                float sum = 0.0f;
+                for (int base = 0; base < cols; base += 128) {
+                    float sc = scl[base / 128];
+                    for (int i = base; i < base + 128; i++) {
+                        float v = ds4vk_e4m3(w[((tile * cols) + i) * 8 + r]);
+                        sum = sum + (xs[i] * v) * sc;
+                    }
+                }
+                y[(long long)t * rows + o] = sum;
+            }
+        }
+    } else {
+        int nblk = (cols + 127) / 128;
+        for (int t = 0; t < tokens; t++) {
+            const float *xs = x + (long long)t * cols;
+            for (int o = 0; o < rows; o++) {
+                const uint8_t *wr = w + (long long)o * cols;
+                const float *scl = bscale + (long long)(o / 128) * nblk;
+                double a = 0.0;
+                for (int bi = 0; bi * 128 < cols; bi++) {
+                    int base = bi * 128;
+                    int blen = (cols - base < 128) ? cols - base : 128;
+                    float acc = 0.0f;
+                    for (int i = base; i < base + blen; i++)
+                        acc = acc + ds4vk_e4m3(wr[i]) * xs[i];
+                    a = a + (double)acc * (double)scl[bi];
+                }
+                y[(long long)t * rows + o] = (float)a;
+            }
+        }
+    }
+    return 1;
+}
+#pragma GCC pop_options
 
 static void stub_upload_log(const char *what, int device, int O, int I,
                             int fmt, long long bytes) {
@@ -84,47 +149,109 @@ static void stub_upload_log(const char *what, int device, int O, int I,
             what, device, O, I, stub_fmt_name(fmt), bytes);
 }
 
+/* Mirror the engine's v4_vk_resolve_spv (deepseek_v4.c, COLI_VULKAN probe):
+ * COLI_VK_SHADERS may be qmatmul.spv itself or a directory; unset, look
+ * alongside the binary (<exedir>/shaders/) before the CWD fallback. */
+static const char *ds4vk_resolve_spv(char *buf, size_t n) {
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if (env && *env) {
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) {
+            snprintf(buf, n, "%s/qmatmul.spv", env);
+            return buf;
+        }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    if (k > 0) {
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
+            strcpy(sl + 1, "shaders/qmatmul.spv");
+            if (!stat(buf, &st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
+
 /* ---- lifecycle / identity ---- */
 
 int dsv4_cuda_init(const int *devices, int count) {
     int device = (devices && count > 0) ? devices[0] : 0;
+    char spv[1024];
+    const char *path = ds4vk_resolve_spv(spv, sizeof(spv));
+    if (!coli_vk_init(path)) {
+        fprintf(stderr, "v4_gpu vk backend=init-failed (%s); continuing-CPU "
+                        "(need libvulkan + committed shaders; set COLI_VK_SHADERS)\n",
+                        path);
+        return 0;
+    }
     fprintf(stderr,
-            "v4_gpu vk backend=stub device=%d (M1-3 seam; real op surface "
-            "lands M2-M3; compute falls back to CPU per D6)\n",
+            "v4_gpu vk backend=vulkan-dsv4 device=%d (M2-3: dense set uploads "
+            "live; compute ops land M3a, fall back to CPU per D6)\n",
             device);
     return 1;
 }
 
-void dsv4_cuda_shutdown(void) {}
+void dsv4_cuda_shutdown(void) { coli_vk_shutdown(); }
 
-int dsv4_cuda_backend_arch_ok(int device) { (void)device; return 1; }
+int dsv4_cuda_backend_arch_ok(int device) { (void)device; return coli_vk_available(); }
 
-const char *dsv4_cuda_backend_name(void) { return "vulkan-dsv4-stub"; }
+const char *dsv4_cuda_backend_name(void) { return "vulkan-dsv4"; }
 
 long long dsv4_cuda_mem_free_mb(int device) {
     (void)device;
-    return 16128; /* RX 6900 XT VRAM; the M2+ backend reports real numbers */
+    double used = 0, budget = 0;
+    if (coli_vk_mem_budget(&used, &budget) && budget > 0) {
+        double free_mb = budget - used;
+        return free_mb > 0 ? (long long)(free_mb / 1e6) : 0;
+    }
+    return 16128; /* RX 6900 XT VRAM; VK_EXT_memory_budget absent */
 }
 
-/* ---- uploads (succeed + log = G7 inventory) ---- */
+/* ---- uploads (M2-3: real; the engine's per-layer plan dump names them) ----
+ * Both fp8 flavours land in the same fmt=8 arena layout (raw e4m3 bytes +
+ * UE8M0 codes expanded to fp32 at upload). fmt=9 (fp8-bf16) only differs in
+ * matmul-time bf16 rounding for the batched attention output path (M4); the
+ * decode grouped matvec uses fmt-8 numerics either way. */
 
 int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t, const uint8_t *w,
                          const uint8_t *scale, int O, int I, int device) {
-    (void)w; (void)scale;
     if (!t) return 0;
-    *t = stub_tensor(device, (long long)O * I, 8);
-    if (!*t) return 0;
-    stub_upload_log("fp8", device, O, I, 8, (long long)O * I);
+    ColiVkTensor *vk = NULL;
+    int ok = device == 0
+        ? coli_vk_tensor_ensure(&vk, w, (const float *)scale, 8, I, O, 0)
+        : coli_vk_dev2_available()
+            ? coli_vk_tensor_ensure2(&vk, w, (const float *)scale, 8, I, O, 0)
+            : 0;
+    if (!ok) { *t = NULL; return 0; }
+    Dsv4CudaTensor *h = calloc(1, sizeof(*h));
+    if (!h) { coli_vk_tensor_free(vk); *t = NULL; return 0; }
+    h->device = device; h->fmt = 8; h->O = O; h->I = I;
+    h->vk = vk; h->bytes = (long long)coli_vk_tensor_bytes(vk);
+    *t = h;
+    stub_upload_log("fp8", device, O, I, 8, h->bytes);
     return 1;
 }
 
 int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t, const uint8_t *w,
                               const uint8_t *scale, int O, int I, int device) {
-    (void)w; (void)scale;
     if (!t) return 0;
-    *t = stub_tensor(device, (long long)O * I, 9);
-    if (!*t) return 0;
-    stub_upload_log("fp8-bf16", device, O, I, 9, (long long)O * I);
+    ColiVkTensor *vk = NULL;
+    int ok = device == 0
+        ? coli_vk_tensor_ensure(&vk, w, (const float *)scale, 8, I, O, 0)
+        : coli_vk_dev2_available()
+            ? coli_vk_tensor_ensure2(&vk, w, (const float *)scale, 8, I, O, 0)
+            : 0;
+    if (!ok) { *t = NULL; return 0; }
+    Dsv4CudaTensor *h = calloc(1, sizeof(*h));
+    if (!h) { coli_vk_tensor_free(vk); *t = NULL; return 0; }
+    h->device = device; h->fmt = 9; h->O = O; h->I = I;
+    h->vk = vk; h->bytes = (long long)coli_vk_tensor_bytes(vk);
+    *t = h;
+    stub_upload_log("fp8-bf16", device, O, I, 9, h->bytes);
     return 1;
 }
 
@@ -132,7 +259,7 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                          const uint8_t *scale, int O, int I, int device) {
     /* Deliberately fails: fp4 expert mirrors are the M5 expert tier. Keeping
      * them NULL keeps the hybrid MoE block unreachable (its failure path is
-     * token-fatal, not a D6 fallback) and the spike run pure-CPU on experts. */
+     * token-fatal, not a D6 fallback) and the run pure-CPU on experts. */
     (void)w; (void)scale; (void)O; (void)I; (void)device;
     if (t) *t = NULL;
     return 0;
@@ -140,22 +267,24 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
 
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t, const uint16_t *w, int O, int I,
                           int device) {
-    (void)w;
-    if (!t) return 0;
-    *t = stub_tensor(device, (long long)O * I * 2, 16);
-    if (!*t) return 0;
-    stub_upload_log("bf16", device, O, I, 16, (long long)O * I * 2);
-    return 1;
+    /* Deferred: bf16 mirrors (compressor / indexer-compressor projections)
+     * only upload under COLI_CUDA_ATTN_BATCH=1, whose batched ops are M4. */
+    (void)w; (void)O; (void)I; (void)device;
+    if (t) *t = NULL;
+    fprintf(stderr, "v4_gpu vk upload bf16 deferred (batched attention ops are "
+                    "M4); tensor stays CPU\n");
+    return 0;
 }
 
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t, const float *w, int O, int I,
                          int device) {
-    (void)w;
-    if (!t) return 0;
-    *t = stub_tensor(device, (long long)O * I * 4, 32);
-    if (!*t) return 0;
-    stub_upload_log("f32", device, O, I, 32, (long long)O * I * 4);
-    return 1;
+    /* Deferred: f32 mirrors (route gate, mHC fn/scale/base, head branch
+     * norms) belong to the M3a/M3c ops; the tensors stay CPU until then. */
+    (void)w; (void)O; (void)I; (void)device;
+    if (t) *t = NULL;
+    fprintf(stderr, "v4_gpu vk upload f32 deferred (route/mHC/head ops land "
+                    "M3a-M3c); tensor stays CPU\n");
+    return 0;
 }
 
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
@@ -166,7 +295,11 @@ int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
 
 /* ---- tensor/activation handles ---- */
 
-void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { free(t); }
+void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) {
+    if (!t) return;
+    if (t->vk) coli_vk_tensor_free(t->vk);
+    free(t);
+}
 
 long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor *t) {
     return t ? t->bytes : 0;

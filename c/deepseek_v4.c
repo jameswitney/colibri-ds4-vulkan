@@ -9581,10 +9581,19 @@ void coli_v4_vk_tier_probe(void) {
                 "continuing-CPU\n");
         return;
     }
-    /* Wanted: verify the GLM backend (libvulkan + committed shaders) resolves.
-     * The dsv4 seam itself is ICD-independent (M1-3 stub) and reports its own
-     * state from coli_v4_gpu_engine_open; this probe catches the requested-
-     * but-unavailable class (upstream #894). */
+    /* M2-3: when wanted, coli_v4_gpu_engine_open (-> dsv4_cuda_init) already
+     * brought the Vulkan backend up for REAL dense uploads. This probe must
+     * NOT init+shutdown a live tier (that killed the backend before uploads
+     * in M1-2/M1-3). It only probes when the backend is NOT already up —
+     * keeping the requested-but-unavailable class (upstream #894) loud
+     * without touching a running tier. */
+    if (coli_vk_available()) {
+        fprintf(stderr,
+                "v4_gpu vk tier=dense-upload (M2-3: backend + shaders resolve; "
+                "resident fp8 weights upload to Vulkan arenas; decode compute "
+                "lands M3a); continuing-CPU\n");
+        return;
+    }
     char spv[1024];
     const char *path = v4_vk_resolve_spv(spv, sizeof(spv));
     if (!coli_vk_init(path)) {
@@ -9597,8 +9606,8 @@ void coli_v4_vk_tier_probe(void) {
     }
     coli_vk_shutdown();
     fprintf(stderr,
-            "v4_gpu vk tier=seam (stub backend wired M1-3; real op surface "
-            "lands M2-M3); continuing-CPU\n");
+            "v4_gpu vk tier=probed-ok (backend resolves; dsv4 seam init "
+            "failed earlier?); continuing-CPU\n");
 }
 #endif /* COLI_VULKAN */
 
@@ -9713,8 +9722,9 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
 #endif
 #if defined(COLI_V4_GPU_TIER_VK)
-    fprintf(stderr, "v4_gpu vk tier=seam device=%d (stub backend M1-3; real op "
-                    "surface lands M2-M3; compute falls back to CPU per D6)\n",
+    fprintf(stderr, "v4_gpu vk tier=dense-upload device=%d (M2-3: resident fp8 "
+                    "weights in Vulkan arenas; decode compute lands M3a, "
+                    "falls back to CPU per D6)\n",
             device);
 #else
     fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);

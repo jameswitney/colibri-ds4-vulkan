@@ -22,13 +22,26 @@
  * entry rename map is implicit and brittle, and a duplicated header would
  * drift from upstream's. One ABI definition, one implementation file.
  *
- * The current implementation is the M1-3 **stub**: it satisfies every
- * dsv4_cuda_* symbol so the seam compiles and links on any box (no ICD), logs
- * the per-layer dense-set uploads (REVIEW G7 inventory), and fails every
- * compute op so the engine falls back to CPU per-op (D6) — output stays
- * token-for-token identical to a pure-CPU run. M2 replaces the bodies with
- * real Vulkan ops (fmt=8 matmul first), M3 wires the decode path.
+ * The implementation is the M1-3 seam stub grown into the M2-3 real dense
+ * tier: init brings up the Vulkan backend and shaders; the fp8 uploads land
+ * the resident dense set in the backend's host-visible arenas (raw e4m3 +
+ * UE8M0->fp32 scale expansion at upload, PLAN D4) with real byte accounting,
+ * and the backend falls back to system-RAM host-visible memory when the
+ * Resizable-BAR window is exhausted. Every compute op still fails so the
+ * engine falls back to CPU per-op (D6) — output stays token-for-token
+ * identical to a pure-CPU run. M3 replaces the compute bodies with real
+ * Vulkan ops (decode path), M4 the batched prefill ops.
  */
 #include "backend_cuda_dsv4.h"
+
+/* ---- ds4vk_* exactness surface (M2-4) ----
+ * ds4vk_fp8_ref_matmul: serial-order CPU replica of the CUDA
+ * dsv4_cuda_fp8_ref_matmul kernels (row-major: fp32-sequential-within-block +
+ * fp64-across-blocks; rows8-packed: (x*v)*scale fp32 sequential) — the BITWISE
+ * reference for the production fmt=8 shader (TEST L1 oracle) and a bitwise
+ * cross-check against the engine's own CPU kernels. Returns 1 on success. */
+int ds4vk_fp8_ref_matmul(const uint8_t *w, const float *bscale,
+                         int rows, int cols, int packed_rows8,
+                         const float *x, int tokens, float *y);
 
 #endif /* COLIBRI_BACKEND_VULKAN_DSV4_H */

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>   /* ldexpf/NAN for the fmt=8 E8M0->fp32 scale expansion */
 static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000.0 + t.tv_nsec/1e6; }
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -48,7 +49,9 @@ static struct {
     VkQueue queue;
     uint32_t qfam;
     uint32_t memtype;            // HOST_VISIBLE|HOST_COHERENT (prefer DEVICE_LOCAL) — for inputs/weights
+    uint32_t memtype_sys;        // M2-3 ReBAR fallback: plain host-visible system-RAM type (no DEVICE_LOCAL)
     uint32_t memtype_cached;     // HOST_CACHED — for buffers the CPU reads back (outputs)
+    int fb_logged;               // ReBAR/system-RAM fallback warning printed once
     VkDescriptorSetLayout dsl;
     VkPipelineLayout plyt;
     VkPipeline pipe;
@@ -61,6 +64,10 @@ static struct {
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
+    /* dsv4 fp8 activation QDQ (3 bindings): x, y, scales — bitwise-equal to
+     * coli_fp8_activation_qdq_ref (M2-2; qdq.spv optional, absent -> CPU path) */
+    VkShaderModule shader_qdq; VkDescriptorSetLayout dsl_qdq; VkPipelineLayout plyt_qdq;
+    VkPipeline pipe_qdq; VkDescriptorPool dpool_qdq; VkDescriptorSet dset_qdq;
     VkCommandPool cpool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -84,6 +91,7 @@ static struct {
     VkBuffer lnbuf[VK_KV_LAYERS]; VkDeviceMemory lnmem[VK_KV_LAYERS]; int lnlen[VK_KV_LAYERS];
     Scratch att_sc;              /* attention score scratch (GPU-only) */
     Scratch att_ctx;             /* fused absorb+o: ctx stays on device (GPU-only) */
+    Scratch qdqs;                /* fp8 activation QDQ scale codes (readback, small) */
     Scratch y2;                  /* second output of the fused matmul pair (readback) */
     VkDescriptorPool pair_pool; VkDescriptorSet dset_pair;   /* 4-binding set for the pair's 2nd matmul */
     VkKvLayer kv[VK_KV_LAYERS];  /* per-layer resident KV latent/rope cache */
@@ -105,6 +113,7 @@ static struct {
 } G;
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
+struct PCQdq { int S, I, block; };   /* push constants of the fp8 activation QDQ shader (qdq.comp) */
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
@@ -138,6 +147,36 @@ static int pick_memtype_cached(VkPhysicalDevice phys) {
     return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
 }
 
+/* M2-3 ReBAR fallback type: the first HOST_VISIBLE|HOST_COHERENT type WITHOUT
+ * DEVICE_LOCAL (plain system RAM). On a discrete card with Resizable BAR
+ * disabled, the preferred memtype is the small (256 MB) DEVICE_LOCAL BAR
+ * window; bulk weight uploads exhaust it after one arena block, so tensors
+ * must fall back to system RAM (correct, slower reads over PCIe) instead of
+ * failing per-tensor. Returns the primary type when no pure-system type
+ * exists (APU unified memory, ReBAR enabled) — the fallback then never fires. */
+static int pick_memtype_sys(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties m;
+    vkGetPhysicalDeviceMemoryProperties(phys, &m);
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return (int)i;
+    }
+    return (int)G.memtype;
+}
+
+/* One-time warning when the preferred host-visible memory is exhausted (the
+ * ReBAR window on a disabled-BAR discrete card) and allocations fall back to
+ * system RAM. Correctness is unaffected; reads are slower over PCIe. */
+static void vk_fb_warn(void) {
+    if (G.fb_logged) return;
+    G.fb_logged = 1;
+    fprintf(stderr, "[VK] warning: host-visible VRAM exhausted (Resizable BAR window full) — "
+                    "falling back to system-RAM host-visible memory (correct, slower over PCIe); "
+                    "enable Resizable BAR / Smart Access Memory in the BIOS for VRAM-resident weights\n");
+}
+
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -145,17 +184,31 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, vo
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size, .memoryTypeIndex = memtype};
+    /* ReBAR window exhaustion (M2-3): try the requested type, then the
+     * system-RAM host-visible type. A 256 MB BAR window on a ReBAR-disabled
+     * card holds the first weight arena but not later scratch buffers; the
+     * fallback keeps the tier correct instead of failing per allocation. */
+    uint32_t tries[2]; int ntries = 0;
+    tries[ntries++] = memtype;
+    if (G.memtype_sys != memtype) tries[ntries++] = G.memtype_sys;
+    for (int k = 0; k < ntries; k++) {
+        if (!(req.memoryTypeBits & (1u << tries[k]))) continue;
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = req.size, .memoryTypeIndex = tries[k]};
 #ifdef VK_EXT_memory_priority
-    VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
-        .priority = G.prio};
-    if (G.has_prio) ai.pNext = &pri;
+        VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+            .priority = G.prio};
+        if (G.has_prio) ai.pNext = &pri;
 #endif
-    VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory");
-    VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
-    if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
-    return 1;
+        if (vkAllocateMemory(G.dev, &ai, NULL, mem) != VK_SUCCESS) {
+            if (k == 0 && ntries > 1) vk_fb_warn();
+            continue;
+        }
+        VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
+        if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
+        return 1;
+    }
+    return 0;
 }
 /* Priority class of subsequent allocations (VK_EXT_memory_priority; no-op without it).
  * Scratches/KV force 1.0 internally; weight uploads take whatever is current — the
@@ -203,17 +256,40 @@ static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt
 
 static int rowwords(int fmt, int I) {
     size_t rb = fmt == 1 ? (size_t)I                         // bytes/row on CPU side
+              : fmt == 8 ? (size_t)I                         // fp8-e4m3: raw bytes, 1 per element
               : fmt == 5 ? ((size_t)I + 63) / 64 * 24        // int3-g64: 24B per 64-group
               : (size_t)(I + 1) / 2;
     return (int)((rb + 3) / 4);                              // padded to uint32 (24|4: exact)
 }
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
- * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
+ * (one f32 per 64-input group), fp8-e4m3 (fmt=8) carries ceil(O/128)*ceil(I/128)
+ * (one f32 per 128x128 block — the E8M0 codes are EXPANDED to fp32 at upload,
+ * PLAN D4). upload_tensor and tensor_free must agree on this. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
+    if (fmt == 8)
+        return (size_t)((O + 127) / 128) * (((size_t)I + 127) / 128);  // per 128x128 block
     return (size_t)O;
+}
+
+/* ---- fmt=8 (dsv4 fp8-e4m3) E8M0 -> fp32 block-scale expansion -------------
+ * The dsv4 resident dense set ships UE8M0 (1-byte, power-of-two) block scales
+ * (128x128 blocks, deepseek_v4.c add_fp8); the shader consumes fp32, so the
+ * codes are expanded at UPLOAD (PLAN D4) — a microsecond pass over ~3 KB/tensor.
+ * The expansion must be bitwise-equal to the CPU decoder (deepseek_v4.c
+ * coli_e8m0_decode / coli_e8m0_table: 0xff -> NaN, else 2^(value-127)); both
+ * single-value and bulk forms are exported so the L1 scale-expansion unit test
+ * exercises exactly the code the upload path runs. */
+float coli_vk_e8m0_expand(uint8_t value) {
+    if (value == 0xff) return NAN;
+    return ldexpf(1.0f, (int)value - 127);
+}
+int coli_vk_expand_e8m0(const uint8_t *src, float *dst, size_t n) {
+    if (!src || !dst) return 0;
+    for (size_t i = 0; i < n; i++) dst[i] = coli_vk_e8m0_expand(src[i]);
+    return 1;
 }
 
 static VkShaderModule load_spv(VkDevice dev, const char *path) {
@@ -364,6 +440,7 @@ int coli_vk_init(const char *spv_path) {
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
     G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys);
+    G.memtype_sys = (uint32_t)pick_memtype_sys(G.phys);   /* M2-3 ReBAR fallback */
 
     /* Resizable-BAR sanity (#523): on discrete cards the weight tiers want
      * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
@@ -427,6 +504,16 @@ int coli_vk_init(const char *spv_path) {
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
 
+    /* Optional dsv4 fp8 activation QDQ pipeline (M2-2): 3 bindings (x, y,
+     * scales), push constants {S, I, block}. Absent -> coli_vk_activation_qdq
+     * returns 0 and the caller stays on the CPU QDQ (D6). */
+    char qdq_path[512]; derive_dir_file(spv_path, "qdq.spv", qdq_path, sizeof(qdq_path));
+    G.shader_qdq = load_spv(G.dev, qdq_path);
+    if (G.shader_qdq) {
+        if (!build_pipeline(G.dev, 3, sizeof(struct PCQdq), G.shader_qdq, &G.dsl_qdq, &G.plyt_qdq, &G.pipe_qdq, &G.dpool_qdq, &G.dset_qdq))
+            return 0;
+    }
+
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
     VKCHECK(vkCreateCommandPool(G.dev, &cpci, NULL, &G.cpool), "cmdPool");
@@ -462,7 +549,7 @@ void coli_vk_mem_info(size_t *used, size_t *count) {
  * live for the process; the rare fill-failure free leaks its slice, bounded) — a
  * tensor's mem handle stays VK_NULL_HANDLE, which coli_vk_tensor_free's vkFreeMemory
  * treats as the documented no-op. */
-typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; struct VkWArena *next; } VkWArena;
+typedef struct VkWArena { VkDeviceMemory mem; uint8_t *base; size_t cap, off; uint32_t memtype; struct VkWArena *next; } VkWArena;
 static VkWArena *g_warena;
 #define VK_WARENA_BLOCK ((size_t)256 << 20)
 static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
@@ -476,27 +563,41 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
     size_t align = req.alignment ? req.alignment : 256, off = 0;
     VkWArena *a = g_warena;
     for (; a; a = a->next) {
+        if (!(req.memoryTypeBits & (1u << a->memtype))) continue;   /* mixed BAR/system arenas (M2-3) */
         off = (a->off + align - 1) & ~(align - 1);
         if (off + req.size <= a->cap) break;
     }
     if (!a) {
         size_t cap = req.size > VK_WARENA_BLOCK ? (req.size + 4095) & ~(size_t)4095 : VK_WARENA_BLOCK;
-        a = calloc(1, sizeof(*a));
-        if (!a) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
-        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = cap, .memoryTypeIndex = G.memtype};
+        /* ReBAR window exhaustion (M2-3): the first 256 MB arena lands in the
+         * DEVICE_LOCAL BAR window; later blocks fall back to system RAM so the
+         * dense set still uploads on a ReBAR-disabled card (slower, correct). */
+        uint32_t tries[2]; int ntries = 0;
+        tries[ntries++] = G.memtype;
+        if (G.memtype_sys != G.memtype) tries[ntries++] = G.memtype_sys;
+        for (int k = 0; k < ntries; k++) {
+            if (!(req.memoryTypeBits & (1u << tries[k]))) continue;
+            a = calloc(1, sizeof(*a));
+            if (!a) break;
+            VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = cap, .memoryTypeIndex = tries[k]};
 #ifdef VK_EXT_memory_priority
-        VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
-            .priority = G.prio};
-        if (G.has_prio) ai.pNext = &pri;
+            VkMemoryPriorityAllocateInfoEXT pri = {.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT,
+                .priority = G.prio};
+            if (G.has_prio) ai.pNext = &pri;
 #endif
-        if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
-            vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
-            if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
-            free(a); vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
+            if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
+                vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS) {
+                if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
+                free(a); a = NULL;
+                if (k == 0 && ntries > 1) vk_fb_warn();
+                continue;
+            }
+            a->cap = cap; a->memtype = tries[k]; a->next = g_warena; g_warena = a;
+            off = 0;
+            break;
         }
-        a->cap = cap; a->next = g_warena; g_warena = a;
-        off = 0;
+        if (!a) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
     }
     VKCHECK(vkBindBufferMemory(G.dev, *buf, a->mem, off), "vkBindBufferMemory");
     if (ptr) *ptr = a->base + off;
@@ -507,15 +608,16 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&              /* fmt=4/7: word-aligned groups only */
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&              /* fmt=4/7: word-aligned groups only */
         !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I); t->gs = (fmt == 4 || fmt == 7) ? gs : 0;
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
     size_t cpu_rb = fmt == 1 ? (size_t)I
+                  : fmt == 8 ? (size_t)I             // fp8-e4m3: raw bytes, byte-identical (D4)
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
-    size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
+    size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64); fmt=8: ceil(O/128)*ceil(I/128)
     t->wbytes = stride * (size_t)O;
     void *wptr;
     if (!arena_suballoc(t->wbytes, &t->wbuf, &wptr)) { free(t); return 0; }
@@ -527,7 +629,11 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
     if (!arena_suballoc(sfl * sizeof(float), &t->sbuf, &sptr)) {
         vkDestroyBuffer(G.dev, t->wbuf, NULL); free(t); return 0;
     }
-    memcpy(sptr, scales, sfl * sizeof(float));
+    if (fmt == 8) {                                    // E8M0 codes -> fp32 blocks, bitwise (D4)
+        coli_vk_expand_e8m0((const uint8_t *)scales, (float *)sptr, sfl);
+    } else {
+        memcpy(sptr, scales, sfl * sizeof(float));
+    }
     // Counters are touched concurrently: frees run from expert_load under
     // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
     __atomic_add_fetch(&G.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
@@ -652,6 +758,66 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
             fprintf(stderr, "[VK_PROF dense] n=%ld | memcpy_x %.0f | desc %.0f | record %.0f | submit %.0f | wait %.0f | memcpy_y %.0f ms\n",
                     p_n, p_x, p_desc, p_rec, p_sub, p_wait, p_y);
     }
+    return 1;
+}
+
+/* dsv4 fp8 activation QDQ (M2-2): bitwise-equal to the CPU reference
+ * coli_fp8_activation_qdq_ref (deepseek_v4.c) — the dense qkv chain feeds the
+ * qdq'd activations into the fp8 matmuls, so any rounding difference here is a
+ * parity break (TEST L1 / REVIEW G9), not a threshold issue.
+ *
+ * y[S*I] = dequantized activations (e4m3 RNE round applied, per-128-block
+ *          UE8M0 scale folded in), scales[S*ceil(I/block)] UE8M0 codes.
+ * block must be in [1,128] (the engine uses 128 for the dense qkv path and 64
+ * for the MLA nope path); I need not be a multiple of block (tail handled).
+ * The `_pre` hoist contract: ONE call feeds both wq_a and wkv (same input) —
+ * the caller keeps y/scales and issues both matmuls against them, mirroring
+ * the engine's hoisted-qdq variants. Returns 1, or 0 when unavailable
+ * (no qdq.spv / no device / bad shape) — the caller falls back to CPU (D6). */
+int coli_vk_activation_qdq(float *y, uint8_t *scales, const float *x,
+                           int S, int I, int block) {
+    if (!G.ready || !G.shader_qdq || S < 1 || I < 1 || block < 1 || block > 128) return 0;
+    int nblk = (I + block - 1) / block;
+    size_t xb = (size_t)S * I * sizeof(float), yb = xb;
+    size_t sb = (size_t)S * nblk * sizeof(uint32_t);   /* shader writes uint per block */
+    if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb, G.memtype_cached) ||
+        !scratch_reserve_mt(&G.qdqs, sb, G.memtype_cached))
+        return 0;
+    memcpy(G.x.ptr, x, xb);
+
+    VkDescriptorBufferInfo bi[3] = {
+        {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.y.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.qdqs.buf, .range = VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[3];
+    for (int i = 0; i < 3; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_qdq,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    vkUpdateDescriptorSets(G.dev, 3, w, 0, NULL);
+
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_qdq);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_qdq, 0, 1, &G.dset_qdq, 0, NULL);
+    struct PCQdq pc = {S, I, block};
+    vkCmdPushConstants(G.cmd, G.plyt_qdq, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)nblk, (uint32_t)S, 1);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) {
+        fprintf(stderr, "[VK] qdq fence wait failed — disabling GPU offload\n");
+        G.ready = 0; return 0;
+    }
+    memcpy(y, G.y.ptr, yb);
+    for (int i = 0; i < S * nblk; i++)
+        scales[i] = (uint8_t)(((uint32_t *)G.qdqs.ptr)[i] & 0xffu);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer was clobbered */
     return 1;
 }
 
@@ -920,7 +1086,7 @@ static int arena_suballoc_d2(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 &&
+    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&
         !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
@@ -928,6 +1094,7 @@ static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float
     t->dev = 1;
     size_t stride = (size_t)t->rowWords * 4;
     size_t cpu_rb = fmt == 1 ? (size_t)I
+                  : fmt == 8 ? (size_t)I
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);
     t->wbytes = stride * (size_t)O;
@@ -941,7 +1108,11 @@ static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float
     if (!arena_suballoc_d2(sfl * sizeof(float), &t->sbuf, &sptr)) {
         vkDestroyBuffer(G2.dev, t->wbuf, NULL); free(t); return 0;
     }
-    memcpy(sptr, scales, sfl * sizeof(float));
+    if (fmt == 8) {
+        coli_vk_expand_e8m0((const uint8_t *)scales, (float *)sptr, sfl);
+    } else {
+        memcpy(sptr, scales, sfl * sizeof(float));
+    }
     __atomic_add_fetch(&G2.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
     __atomic_add_fetch(&G2.tensor_count, 1, __ATOMIC_RELAXED);
     *out = t;
@@ -1570,6 +1741,13 @@ void coli_vk_shutdown(void) {
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_att, NULL);
         vkDestroyShaderModule(G.dev, G.shader_att, NULL);
     }
+    if (G.shader_qdq) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_qdq, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_qdq, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_qdq, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_qdq, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_qdq, NULL);
+    }
     for (VkWArena *a = g_warena; a;) {   /* weight arenas: unmapped/freed with the device */
         VkWArena *nx = a->next;
         vkUnmapMemory(G.dev, a->mem); vkFreeMemory(G.dev, a->mem, NULL);
@@ -1591,15 +1769,29 @@ static double now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts
 
 static int g_ref_gs = 64;   /* fmt=4 group size the harness cases use */
 static size_t ref_rowbytes(int fmt, int I) {
-    return fmt == 1 ? (size_t)I : fmt == 5 ? (size_t)((I + 63) / 64) * 24 : (size_t)(I + 1) / 2;
+    return fmt == 1 ? (size_t)I : fmt == 8 ? (size_t)I
+         : fmt == 5 ? (size_t)((I + 63) / 64) * 24 : (size_t)(I + 1) / 2;
 }
-static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5)
+static size_t ref_scales(int fmt, int I, int O) {   // scale COUNT (per-group for fmt 4/5, per 128x128 block for fmt 8)
     if (fmt == 5) return (size_t)O * (size_t)((I + 63) / 64);
     if (fmt == 4) return (size_t)O * (size_t)((I + g_ref_gs - 1) / g_ref_gs);
+    if (fmt == 8) return (size_t)((O + 127) / 128) * (size_t)((I + 127) / 128);
     return (size_t)O;
 }
+/* fmt=8 E4M3FN scalar decode — mirrors deepseek_v4.c coli_e4m3fn_decode bitwise
+ * (ldexpf; all dyadic, so exact fp32): exp==15&&man==7 -> NaN, exp==0 -> m*2^-9,
+ * else (1+m/8)*2^(e-7), sign applied. */
+static float deq8(uint8_t b) {
+    int sign = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    if (e == 15 && m == 7) return NAN;
+    float v = e ? ldexpf(1.0f + (float)m / 8.0f, e - 7) : ldexpf((float)m, -9);
+    return sign ? -v : v;
+}
+/* fmt=8 UE8M0 -> fp32, bitwise-equal to the CPU decode (coli_e8m0_decode). */
+static float deq8scale(uint8_t b) { return b == 0xff ? NAN : ldexpf(1.0f, (int)b - 127); }
 static float deq(const uint8_t *row, int fmt, int i) {
     if (fmt == 1) { int b = ((const int8_t *)row)[i]; return (float)b; }
+    if (fmt == 8) return deq8(row[i]);
     if (fmt == 5) {   // int3-g64: 16B low plane (2 bits) + 8B high plane (1 bit), v+4
         const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; int j = i & 63;
         unsigned u = ((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2);
@@ -1611,9 +1803,17 @@ static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
                     int fmt, int S, int I, int O) {
     size_t rb = ref_rowbytes(fmt, I);
     int gw2 = fmt == 4 ? g_ref_gs : 64, ng = (I + gw2 - 1) / gw2;
+    int nblk8 = (I + 127) / 128;
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double sum = 0; const uint8_t *row = w + (size_t)o * rb;
-        if (fmt == 5 || fmt == 4) {   // per-group scales fold inside the sum
+        if (fmt == 8) {   // one f32 scale per 128x128 block: (o/128)*ceil(I/128)+i/128
+            for (int bi = 0; bi * 128 < I; bi++) {
+                double a = 0; int end = (bi + 1) * 128 < I ? (bi + 1) * 128 : I;
+                for (int i = bi * 128; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
+                sum += a * sc[(size_t)(o / 128) * nblk8 + bi];
+            }
+            y[s * O + o] = (float)sum;
+        } else if (fmt == 5 || fmt == 4) {   // per-group scales fold inside the sum
             for (int g = 0; g < ng; g++) {
                 double a = 0; int end = (g + 1) * gw2 < I ? (g + 1) * gw2 : I;
                 for (int i = g * gw2; i < end; i++) a += x[s * I + i] * deq(row, fmt, i);
@@ -1630,6 +1830,15 @@ static void cpu_ref(float *y, const float *x, const uint8_t *w, const float *sc,
 /* dequant dot of one weight row against x with that row's scales applied —
  * per-row for fmt 1/2, per 64-group for fmt=5. scb = tensor scale array, o = row. */
 static double ref_dot(const float *x, const uint8_t *row, const float *scb, int o, int fmt, int I) {
+    if (fmt == 8) {
+        int nblk = (I + 127) / 128; double sum = 0;
+        for (int bi = 0; bi * 128 < I; bi++) {
+            double a = 0; int end = (bi + 1) * 128 < I ? (bi + 1) * 128 : I;
+            for (int i = bi * 128; i < end; i++) a += x[i] * deq(row, fmt, i);
+            sum += a * scb[(size_t)(o / 128) * nblk + bi];
+        }
+        return sum;
+    }
     if (fmt == 5 || fmt == 4) {
         int gw2 = fmt == 4 ? g_ref_gs : 64;
         int ng = (I + gw2 - 1) / gw2; double sum = 0;
@@ -1650,14 +1859,26 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     float *x = malloc((size_t)S * I * sizeof(float));
     uint8_t *w = malloc(rb * O);
     float *sc = malloc(nsc * sizeof(float));
+    uint8_t *e8 = fmt == 8 ? malloc(nsc) : NULL;      /* fmt=8: upload takes UE8M0 codes */
     float *yg = malloc((size_t)S * O * sizeof(float));
     float *yc = malloc((size_t)S * O * sizeof(float));
     for (int i = 0; i < S * I; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
-    for (size_t i = 0; i < rb * O; i++) w[i] = rand() & 0xff;
-    for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
+    for (size_t i = 0; i < rb * O; i++) {
+        /* fmt=8: keep the two e4m3 NaN codes (0x7f/0xff) out — real weights
+         * never carry them, and they poison every dot product with NaN (which
+         * "matches" trivially on both sides and masked early maxrel measures) */
+        if (fmt == 8) { uint8_t c = (uint8_t)(rand() & 0xff); w[i] = (c & 0x7f) == 0x7f ? (uint8_t)(c & 0x7e) : c; }
+        else w[i] = (uint8_t)(rand() & 0xff);
+    }
+    for (size_t i = 0; i < nsc; i++) {
+        if (fmt == 8) {                                /* realistic UE8M0 codes around 2^-1..2^0 */
+            uint8_t code = (uint8_t)(120 + rand() % 16);
+            e8[i] = code; sc[i] = deq8scale(code);
+        } else sc[i] = 0.01f + (rand() % 100) / 10000.0f;
+    }
 
     ColiVkTensor *t = NULL;
-    if (!coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
+    if (!coli_vk_matmul(&t, yg, x, w, fmt == 8 ? (const float *)e8 : sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
     cpu_ref(yc, x, w, sc, fmt, S, I, O);
     double maxerr = 0, maxrel = 0;
     for (int i = 0; i < S * O; i++) {
@@ -1666,15 +1887,179 @@ static int run_case(int fmt, int S, int I, int O, int iters) {
     }
     // microbench (GPU)
     double t0 = now();
-    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yg, x, w, sc, fmt, S, I, O, g_ref_gs);
+    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yg, x, w, fmt == 8 ? (const float *)e8 : sc, fmt, S, I, O, g_ref_gs);
     double gpu_ms = (now() - t0) * 1000 / iters;
     // microbench (CPU ref, 1 iter — it's slow)
     double c0 = now(); cpu_ref(yc, x, w, sc, fmt, S, I, O); double cpu_ms = (now() - c0) * 1000;
     printf("fmt=%d S=%d I=%d O=%d | maxerr=%.4g maxrel=%.4g | gpu=%.3f ms  cpu_ref=%.3f ms\n",
            fmt, S, I, O, maxerr, maxrel, gpu_ms, cpu_ms);
     coli_vk_tensor_free(t);
-    free(x); free(w); free(sc); free(yg); free(yc);
-    return maxrel > 1e-3 ? 1 : 0;
+    free(x); free(w); free(sc); free(e8); free(yg); free(yc);
+    /* fmt=8 is fp32-tree vs the double-accumulate ref: maxrel ~1e-6..1e-2 on
+     * cancellation-heavy random rows (measured with NaN-free weights — the
+     * unfiltered random bytes of the original M2-1 harness poisoned every dot
+     * product with NaN, masking all error). The tight gate is the L1 chain
+     * test (global maxabs/maxref ~1e-7) and L3 token parity; here a 5e-2 bound
+     * separates a broken shader (~1.0) from fp32 reduction order. */
+    return (fmt == 8 ? maxrel > 5e-2 : maxrel > 1e-3) ? 1 : 0;
+}
+
+/* Bitwise scale-expansion unit test (TEST L1 gate): the fmt=8 upload expands the
+ * UE8M0 codes to fp32 via coli_vk_expand_e8m0 — the exact function upload_tensor
+ * runs — and that expansion must be bitwise-equal to the CPU decoder
+ * (deepseek_v4.c coli_e8m0_decode: 0xff -> NaN, else 2^(value-127)). Covers the
+ * full 256-code range AND realistic tensor shapes (ceil(O/128)*ceil(I/128) codes),
+ * comparing IEEE-754 bit patterns (NaN == NaN by both-isnan). */static int run_e8_expand(void) {
+    int bad = 0;
+    uint8_t src[256];
+    float dst[256];
+    for (int v = 0; v < 256; v++) src[v] = (uint8_t)v;
+    if (!coli_vk_expand_e8m0(src, dst, 256)) { printf("e8 expand: helper refused\n"); return 1; }
+    for (int v = 0; v < 256; v++) {
+        float want = deq8scale(src[v]);
+        uint32_t wb, db;
+        memcpy(&wb, &want, 4); memcpy(&db, &dst[v], 4);
+        if (!((want != want && dst[v] != dst[v]) || wb == db)) {
+            printf("e8 expand: BIT MISMATCH code 0x%02x want 0x%08x got 0x%08x\n", src[v], wb, db);
+            bad = 1;
+        }
+    }
+    /* realistic shape: wq_a (1024x4096) scale tensor = ceil(1024/128)*ceil(4096/128) = 8*32 */
+    int shapes[][2] = {{8, 32}, {12, 32}, {7, 31}, {1, 1}};   /* rows128, cols128 (ceil counts) */
+    for (int s = 0; s < 4 && !bad; s++) {
+        size_t n = (size_t)shapes[s][0] * shapes[s][1];
+        uint8_t *e8 = malloc(n); float *got = malloc(n * 4), *want = malloc(n * 4);
+        for (size_t i = 0; i < n; i++) e8[i] = (uint8_t)rand();
+        if (!coli_vk_expand_e8m0(e8, got, n)) { printf("e8 expand: bulk refused\n"); bad = 1; }
+        else {
+            for (size_t i = 0; i < n; i++) want[i] = deq8scale(e8[i]);
+            for (size_t i = 0; i < n && !bad; i++) {
+                uint32_t wb, db;
+                memcpy(&wb, &want[i], 4); memcpy(&db, &got[i], 4);
+                if (!((want[i] != want[i] && got[i] != got[i]) || wb == db)) {
+                    printf("e8 expand: BIT MISMATCH shape %dx%d @%zu code 0x%02x\n",
+                           shapes[s][0], shapes[s][1], i, e8[i]);
+                    bad = 1;
+                }
+            }
+        }
+        free(e8); free(got); free(want);
+    }
+    printf("e8 scale expansion (bitwise vs CPU decode): %s\n", bad ? "FAIL" : "PASS (256 codes + 4 shapes)");
+    return bad;
+}
+
+/* ---- Activation QDQ bitwise test (TEST L1 / REVIEW G9) --------------------
+ * The GPU qdq.comp must reproduce coli_fp8_activation_qdq_ref BITWISE — the qkv
+ * chain feeds these activations into the fp8 matmuls, so a rounding difference
+ * is a parity break, not a threshold issue. The local replica below is an exact
+ * C port of the engine function (same fmaxf/ldexpf/frexpf order); the
+ * authoritative oracle lives in tests/test_vk_dsv4_fp8.c, which links the REAL
+ * engine unit (COLI_V4_UNIT_NATIVE_QUANT) and compares bit-for-bit. */
+static uint8_t enc8(float value) {   /* bit-exact port of coli_e4m3fn_encode */
+    if (isnan(value)) return 0x7f;
+    int negative = signbit(value) != 0;
+    float magnitude = fabsf(value);
+    if (!magnitude) return negative ? 0x80 : 0;
+    if (magnitude >= 448.0f) return (uint8_t)((negative ? 0x80 : 0) | 0x7e);
+    uint8_t best = 0;
+    if (magnitude < 0.015625f) {
+        float scaled = magnitude * 512.0f;
+        uint8_t rounded = (uint8_t)scaled;
+        float fraction = scaled - rounded;
+        if (fraction > 0.5f || (fraction == 0.5f && (rounded & 1))) rounded++;
+        best = rounded;
+    } else {
+        uint32_t bits; memcpy(&bits, &magnitude, sizeof(bits));
+        int exponent = (int)((bits >> 23) & 0xff) - 127;
+        uint32_t significand = 0x800000u | (bits & 0x7fffffu);
+        uint32_t rounded = significand >> 20;
+        uint32_t remainder = significand & 0xfffffu;
+        if (remainder > 0x80000u || (remainder == 0x80000u && (rounded & 1u))) rounded++;
+        if (rounded == 16u) { rounded = 8u; exponent++; }
+        best = (uint8_t)((exponent + 7) * 8 + (int)rounded - 8);
+    }
+    return (uint8_t)(best | (negative ? 0x80 : 0));
+}
+static int ceil_log2_pos(float value) {   /* engine ceil_log2_positive */
+    int exponent; float fraction = frexpf(value, &exponent);
+    return fraction == 0.5f ? exponent - 1 : exponent;
+}
+static void qdq_ref(float *y, uint8_t *sc, const float *x, size_t n, size_t block) {
+    for (size_t base = 0; base < n; base += block) {
+        size_t count = n - base < block ? n - base : block;
+        float maximum = 0.0f;
+        for (size_t i = 0; i < count; i++) maximum = fmaxf(maximum, fabsf(x[base + i]));
+        maximum = fmaxf(maximum, 1e-4f);
+        int se = ceil_log2_pos(maximum / 448.0f);
+        if (se < -127) se = -127;
+        if (se > 127) se = 127;
+        uint8_t code = (uint8_t)(se + 127);
+        float scale = deq8scale(code);
+        sc[base / block] = code;
+        for (size_t i = 0; i < count; i++) {
+            float normalized = fmaxf(-448.0f, fminf(448.0f, x[base + i] / scale));
+            y[base + i] = deq8(enc8(normalized)) * scale;
+        }
+    }
+}
+static int run_qdq(void) {
+    int bad = 0;
+    struct { int S, I, block; int mode; const char *tag; } cases[] = {
+        {1, 4096, 128, 0, "wq_a decode"},
+        {8, 4096, 128, 3, "batch mixed"},
+        {1, 130, 128, 0, "tail"},
+        {1, 576, 64, 0, "kv_nope b64"},
+        {2, 1024, 64, 3, "b64 tail"},
+        {1, 128, 128, 1, "small"},
+        {1, 128, 128, 2, "tiny (exp clamp -127)"},
+        {1, 128, 128, 4, "dyadic/ties"},
+        {1, 1, 128, 0, "single"},
+        {1, 7, 7, 0, "block=7"},
+        {128, 512, 128, 3, "prefill"},
+    };
+    static const float dy[] = {1.0f, 2.0f, 0.5f, 448.0f, -448.0f, 0.015625f,
+        0.0029296875f, 0.0009765625f, 1.5f, 1.75f, 0.0f, -0.0f, 2e-38f,
+        0.001953125f, -0.001953125f, 0.00390625f};
+    for (int c = 0; c < (int)(sizeof(cases)/sizeof(cases[0])); c++) {
+        int S = cases[c].S, I = cases[c].I, block = cases[c].block;
+        size_t nblk = (size_t)S * ((I + block - 1) / block);
+        float *x = malloc((size_t)S * I * 4), *yg = malloc((size_t)S * I * 4);
+        float *yc = malloc((size_t)S * I * 4);
+        uint8_t *scg = malloc(nblk), *scc = malloc(nblk);
+        for (int i = 0; i < S * I; i++) {
+            switch (cases[c].mode) {
+                case 0: x[i] = (float)(rand() % 200000 - 100000) / 100.0f; break;  /* [-1000,1000]: clamps */
+                case 1: x[i] = (float)(rand() % 20000 - 10000) / 10000000.0f; break; /* ~1e-3: subnormal branch */
+                case 2: x[i] = (float)(rand() % 1000 - 500) * 1e-38f; break;      /* ~5e-36: scale exp clamps */
+                case 3: x[i] = (i & 1) ? (float)(rand() % 200000 - 100000) / 100.0f
+                                       : (float)(rand() % 20000 - 10000) / 10000000.0f; break;
+                default: x[i] = dy[(i + c) % (int)(sizeof(dy)/sizeof(dy[0]))]; break;
+            }
+        }
+        int ok = coli_vk_activation_qdq(yg, scg, x, S, I, block);
+        qdq_ref(yc, scc, x, (size_t)S * I, (size_t)block);
+        if (!ok) { printf("qdq: coli_vk_activation_qdq refused (S=%d I=%d block=%d)\n", S, I, block); bad = 1; }
+        else {
+            for (size_t i = 0; i < (size_t)S * I && !bad; i++) {
+                uint32_t a, b; memcpy(&a, &yg[i], 4); memcpy(&b, &yc[i], 4);
+                if (!((yg[i] != yg[i] && yc[i] != yc[i]) || a == b)) {
+                    printf("qdq: BIT MISMATCH %s @%zu: gpu 0x%08x cpu 0x%08x\n", cases[c].tag, i, a, b);
+                    bad = 1;
+                }
+            }
+            for (size_t i = 0; i < nblk && !bad; i++)
+                if (scg[i] != scc[i]) {
+                    printf("qdq: SCALE MISMATCH %s @%zu: gpu %u cpu %u\n", cases[c].tag, i, scg[i], scc[i]);
+                    bad = 1;
+                }
+        }
+        printf("qdq %-22s S=%d I=%d block=%d : %s\n", cases[c].tag, S, I, block, ok && !bad ? "bitwise OK" : "FAIL");
+        if (bad) break;
+        free(x); free(yg); free(yc); free(scg); free(scc);
+    }
+    printf("activation QDQ (bitwise vs CPU replica): %s\n", bad ? "FAIL" : "PASS");
+    return bad;
 }
 
 /* Batched throughput: record N dispatches in ONE command buffer, one submit + one
@@ -2159,6 +2544,26 @@ int main(int argc, char **argv) {
         bad |= run_absorb(4, 1, 64, 192, 64, 256, 512, 0, 300, 7);    // grouped-int4 kv_b + o
         bad |= run_absorb(4, 2, 64, 192, 64, 256, 512, 17, 300, 8);   // fmt=4 S=2 causal + window
     }
+    /* fmt=8 (dsv4 fp8-e4m3) — added LAST so the fixed rand stream of the
+     * pre-existing cases (seed 1234) is untouched. REAL dense shapes from the
+     * DeepSeek-V4-Flash config (hidden 4096, q_rank 1024, head_dim 512,
+     * o_groups 8, o_lora_rank 1024 -> o_width 8192, moe 2048). Weights are raw
+     * e4m3 bytes (byte-identical upload); scales are UE8M0 codes expanded to
+     * fp32 at upload. First the bitwise scale-expansion gate (TEST L1). */
+    bad |= run_e8_expand();
+    bad |= run_case(8, 1, 4096, 1024, 30);   // attn.wq_a: q_rank x hidden (decode)
+    bad |= run_case(8, 1, 4096, 512, 30);    // attn.wkv: head_dim x hidden
+    bad |= run_case(8, 1, 1024, 32768, 10);  // attn.wq_b: heads*head_dim x q_rank
+    bad |= run_case(8, 1, 8192, 4096, 20);   // attn.wo_b: hidden x o_width (I>6144: unstaged)
+    bad |= run_case(8, 1, 4096, 2048, 30);   // ffn.shared_experts.w2
+    bad |= run_case(8, 1, 4096, 8192, 20);   // attn.wo_a: o_width x o_group_width
+    bad |= run_case(8, 128, 4096, 1024, 10); // prefill batch (S=128) on wq_a shape
+    bad |= run_case(8, 1, 130, 70, 20);      // partial tail blocks (I%128!=0, O%128!=0)
+    bad |= run_case(8, 1, 128, 64, 20);      // single block
+    bad |= run_case(8, 1, 7, 3, 20);         // tiny (sub-word row)
+    /* Activation QDQ bitwise gate (M2-2, TEST L1 / REVIEW G9) — needs qdq.spv */
+    if (G.shader_qdq) bad |= run_qdq();
+    else printf("activation QDQ: qdq.spv absent — SKIPPED\n");
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;

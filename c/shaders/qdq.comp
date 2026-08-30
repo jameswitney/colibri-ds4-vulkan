@@ -1,0 +1,147 @@
+#version 450
+// dsv4 fp8 activation QDQ (M2-2): a bitwise replica of the CPU reference
+// coli_fp8_activation_qdq_ref (deepseek_v4.c). Per block_size elements:
+//   maximum = max(|x|)  floored at 1e-4
+//   e = clamp(ceil_log2(maximum/448.0), -127, 127); code = e+127; scale = 2^e
+//   y[i] = e4m3_decode(e4m3_encode(clamp(x[i]/scale, -448, 448))) * scale
+// The dense qkv path uses block=128 (wq_a + wkv share ONE qdq pass — the _pre
+// hoist); the MLA nope path uses 64. Grid = (ceil(I/block), S), one block per
+// 128-thread workgroup (idle lanes contribute 0 to the max — safe, the result
+// is floored at 1e-4).
+//
+// BITWISE contract (TEST L1): every operation is reproduced exactly:
+//   - the max reduction is order-independent (max is a commutative monoid;
+//     fmaxf vs GLSL max agree on finite values), so the shared-tree reduction
+//     equals the CPU's sequential scan;
+//   - maximum/448.0 and x/scale are correctly-rounded fp32 divisions
+//     (SPIR-V OpFDiv; scale is a power of two so x/scale is exact in range);
+//   - ceil_log2 via fp32 exponent/mantissa bits, matching frexpf semantics
+//     (value is always a normal >= 2^-22 here, so bit extraction is exact);
+//   - scale = 2^e via bit patterns, matching ldexpf(1.f, e) exactly
+//     (incl. the e == -127 subnormal);
+//   - the RNE E4M3FN encoder is ported bit-for-bit from coli_e4m3fn_encode
+//     (subnormal branch: mag*512, truncate, ties-to-even; normal branch:
+//     significand >> 20, 0x80000 half-ulp remainder, carry on 16);
+//   - E4M3 decode via the same 256-entry bit-pattern LUT as qmatmul.comp.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) writeonly buffer Y { float y[]; };
+layout(std430, binding = 2) writeonly buffer SC { uint sc[]; };  // one UE8M0 code per block
+
+layout(push_constant) uniform P {
+    int S, I, block;
+} p;
+
+const uint E4M3_BITS[256] = uint[256](
+    0x00000000u, 0x3b000000u, 0x3b800000u, 0x3bc00000u, 0x3c000000u, 0x3c200000u, 0x3c400000u, 0x3c600000u,
+    0x3c800000u, 0x3c900000u, 0x3ca00000u, 0x3cb00000u, 0x3cc00000u, 0x3cd00000u, 0x3ce00000u, 0x3cf00000u,
+    0x3d000000u, 0x3d100000u, 0x3d200000u, 0x3d300000u, 0x3d400000u, 0x3d500000u, 0x3d600000u, 0x3d700000u,
+    0x3d800000u, 0x3d900000u, 0x3da00000u, 0x3db00000u, 0x3dc00000u, 0x3dd00000u, 0x3de00000u, 0x3df00000u,
+    0x3e000000u, 0x3e100000u, 0x3e200000u, 0x3e300000u, 0x3e400000u, 0x3e500000u, 0x3e600000u, 0x3e700000u,
+    0x3e800000u, 0x3e900000u, 0x3ea00000u, 0x3eb00000u, 0x3ec00000u, 0x3ed00000u, 0x3ee00000u, 0x3ef00000u,
+    0x3f000000u, 0x3f100000u, 0x3f200000u, 0x3f300000u, 0x3f400000u, 0x3f500000u, 0x3f600000u, 0x3f700000u,
+    0x3f800000u, 0x3f900000u, 0x3fa00000u, 0x3fb00000u, 0x3fc00000u, 0x3fd00000u, 0x3fe00000u, 0x3ff00000u,
+    0x40000000u, 0x40100000u, 0x40200000u, 0x40300000u, 0x40400000u, 0x40500000u, 0x40600000u, 0x40700000u,
+    0x40800000u, 0x40900000u, 0x40a00000u, 0x40b00000u, 0x40c00000u, 0x40d00000u, 0x40e00000u, 0x40f00000u,
+    0x41000000u, 0x41100000u, 0x41200000u, 0x41300000u, 0x41400000u, 0x41500000u, 0x41600000u, 0x41700000u,
+    0x41800000u, 0x41900000u, 0x41a00000u, 0x41b00000u, 0x41c00000u, 0x41d00000u, 0x41e00000u, 0x41f00000u,
+    0x42000000u, 0x42100000u, 0x42200000u, 0x42300000u, 0x42400000u, 0x42500000u, 0x42600000u, 0x42700000u,
+    0x42800000u, 0x42900000u, 0x42a00000u, 0x42b00000u, 0x42c00000u, 0x42d00000u, 0x42e00000u, 0x42f00000u,
+    0x43000000u, 0x43100000u, 0x43200000u, 0x43300000u, 0x43400000u, 0x43500000u, 0x43600000u, 0x43700000u,
+    0x43800000u, 0x43900000u, 0x43a00000u, 0x43b00000u, 0x43c00000u, 0x43d00000u, 0x43e00000u, 0x7fc00000u,
+    0x80000000u, 0xbb000000u, 0xbb800000u, 0xbbc00000u, 0xbc000000u, 0xbc200000u, 0xbc400000u, 0xbc600000u,
+    0xbc800000u, 0xbc900000u, 0xbca00000u, 0xbcb00000u, 0xbcc00000u, 0xbcd00000u, 0xbce00000u, 0xbcf00000u,
+    0xbd000000u, 0xbd100000u, 0xbd200000u, 0xbd300000u, 0xbd400000u, 0xbd500000u, 0xbd600000u, 0xbd700000u,
+    0xbd800000u, 0xbd900000u, 0xbda00000u, 0xbdb00000u, 0xbdc00000u, 0xbdd00000u, 0xbde00000u, 0xbdf00000u,
+    0xbe000000u, 0xbe100000u, 0xbe200000u, 0xbe300000u, 0xbe400000u, 0xbe500000u, 0xbe600000u, 0xbe700000u,
+    0xbe800000u, 0xbe900000u, 0xbea00000u, 0xbeb00000u, 0xbec00000u, 0xbed00000u, 0xbee00000u, 0xbef00000u,
+    0xbf000000u, 0xbf100000u, 0xbf200000u, 0xbf300000u, 0xbf400000u, 0xbf500000u, 0xbf600000u, 0xbf700000u,
+    0xbf800000u, 0xbf900000u, 0xbfa00000u, 0xbfb00000u, 0xbfc00000u, 0xbfd00000u, 0xbfe00000u, 0xbff00000u,
+    0xc0000000u, 0xc0100000u, 0xc0200000u, 0xc0300000u, 0xc0400000u, 0xc0500000u, 0xc0600000u, 0xc0700000u,
+    0xc0800000u, 0xc0900000u, 0xc0a00000u, 0xc0b00000u, 0xc0c00000u, 0xc0d00000u, 0xc0e00000u, 0xc0f00000u,
+    0xc1000000u, 0xc1100000u, 0xc1200000u, 0xc1300000u, 0xc1400000u, 0xc1500000u, 0xc1600000u, 0xc1700000u,
+    0xc1800000u, 0xc1900000u, 0xc1a00000u, 0xc1b00000u, 0xc1c00000u, 0xc1d00000u, 0xc1e00000u, 0xc1f00000u,
+    0xc2000000u, 0xc2100000u, 0xc2200000u, 0xc2300000u, 0xc2400000u, 0xc2500000u, 0xc2600000u, 0xc2700000u,
+    0xc2800000u, 0xc2900000u, 0xc2a00000u, 0xc2b00000u, 0xc2c00000u, 0xc2d00000u, 0xc2e00000u, 0xc2f00000u,
+    0xc3000000u, 0xc3100000u, 0xc3200000u, 0xc3300000u, 0xc3400000u, 0xc3500000u, 0xc3600000u, 0xc3700000u,
+    0xc3800000u, 0xc3900000u, 0xc3a00000u, 0xc3b00000u, 0xc3c00000u, 0xc3d00000u, 0xc3e00000u, 0x7fc00000u
+);
+
+float e4m3_decode(uint code) { return intBitsToFloat(int(E4M3_BITS[code & 0xffu])); }
+
+/* Bit-exact port of coli_e4m3fn_encode (RNE to the E4M3FN grid). */
+uint e4m3_encode(float v) {
+    uint sign = (floatBitsToUint(v) >> 31u) & 1u;
+    float mag = abs(v);
+    if (mag == 0.0f) return sign << 7u;
+    if (mag >= 448.0f) return (sign << 7u) | 0x7eu;
+    if (mag < 0.015625f) {                       // subnormal e4m3 region: m*2^-9
+        float scaled = mag * 512.0f;
+        uint r = uint(scaled);                   // truncate
+        float fraction = scaled - float(r);
+        if (fraction > 0.5f || (fraction == 0.5f && (r & 1u) != 0u)) r++;
+        return (r & 0xffu) | (sign << 7u);
+    }
+    uint bits = floatBitsToUint(mag);
+    int exponent = int((bits >> 23u) & 0xffu) - 127;
+    uint significand = 0x800000u | (bits & 0x7fffffu);
+    uint r = significand >> 20u;
+    uint rem = significand & 0xfffffu;
+    if (rem > 0x80000u || (rem == 0x80000u && (r & 1u) != 0u)) r++;
+    if (r == 16u) { r = 8u; exponent++; }
+    uint best = uint((exponent + 7) * 8 + int(r) - 8);
+    return (best & 0xffu) | (sign << 7u);
+}
+
+/* 2^e via bit patterns, bitwise-equal to ldexpf(1.f, e) (e in [-127, 127]). */
+float scale_from_code(uint code) {
+    int e = int(code) - 127;
+    if (e == -127) return uintBitsToFloat(0x00400000u);   // 2^-127 (subnormal)
+    return uintBitsToFloat(uint(e + 127) << 23u);
+}
+
+/* ceil_log2(v) for v a normal fp32 > 0 (frexpf semantics: v = f*2^e, f in
+ * [0.5,1); result e-1 iff f == 0.5 exactly, i.e. v is a power of two). */
+int ceil_log2(float v) {
+    uint bits = floatBitsToUint(v);
+    int e = int((bits >> 23u) & 0xffu) - 127;    // unbiased exponent
+    uint mant = bits & 0x7fffffu;
+    return (mant == 0u) ? e : e + 1;
+}
+
+shared float mx[128];
+shared uint  g_code;
+
+void main() {
+    int s = int(gl_WorkGroupID.y);
+    int b = int(gl_WorkGroupID.x);
+    int nblk = (p.I + p.block - 1) / p.block;
+    int base = b * p.block;
+    int count = min(p.block, p.I - base);
+    int tid = int(gl_LocalInvocationID.x);
+    float v = 0.0f;                              // idle lanes: neutral for max
+    if (tid < count) v = abs(x[s * p.I + base + tid]);
+    mx[tid] = v;
+    barrier();
+    for (int n = 64; n > 0; n >>= 1) {
+        if (tid < n) mx[tid] = max(mx[tid], mx[tid + n]);
+        barrier();
+    }
+    if (tid == 0) {
+        float maximum = max(mx[0], 1e-4f);
+        float ratio = maximum / 448.0f;          // fp32 div: correctly rounded
+        int e = ceil_log2(ratio);
+        e = clamp(e, -127, 127);
+        uint code = uint(e + 127);
+        g_code = code;
+        sc[s * nblk + b] = code;
+    }
+    barrier();
+    float scale = scale_from_code(g_code);
+    if (tid < count) {
+        int i = base + tid;
+        float normalized = clamp(x[s * p.I + i] / scale, -448.0f, 448.0f);
+        y[s * p.I + i] = e4m3_decode(e4m3_encode(normalized)) * scale;
+    }
+}

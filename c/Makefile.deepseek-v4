@@ -225,7 +225,7 @@ endif
 CFLAGS   += -DCOLI_VULKAN -DCOLI_V4_GPU_TIER -DCOLI_V4_GPU_TIER_VK
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o backend_vulkan_dsv4.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/qdq.spv
 V4_WIN_EXTRA_OBJS += $(VK_OBJ)
 endif
 
@@ -302,6 +302,26 @@ backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
 # regenerates one when its .comp is newer (needs glslc from shaderc).
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+
+# L1/L2 synthetic suite (TEST.md §6): fmt=8 fp8-e4m3 matmul + activation QDQ +
+# the M2-4 exactness gates. The QDQ/exactness gates link the REAL engine unit
+# (COLI_V4_UNIT_NATIVE_QUANT) as the oracle — built WITHOUT the GPU-tier defines
+# so the pure-CPU reference paths are what link, with -ffunction-sections and
+# gc-sections at link so only the referenced functions survive. The dsv4 op
+# surface object (backend_vulkan_dsv4.c) supplies the ds4vk_fp8_ref_matmul
+# bitwise replica. VK=1 only; skips (exit 0) without a Vulkan ICD.
+.PHONY: test-vk-dsv4
+ifeq ($(VK),1)
+VK_DQDQ_ORACLE_OBJ = tests/.vk_dqdq_oracle.o
+tests/.vk_dqdq_oracle.o: deepseek_v4.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections \
+		-UCOLI_V4_GPU_TIER -UCOLI_V4_GPU_TIER_VK -UCOLI_VULKAN \
+		-DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+test-vk-dsv4: shaders/qmatmul.spv shaders/qdq.spv $(VK_DQDQ_ORACLE_OBJ)
+	$(CC) -O2 -I. tests/test_vk_dsv4_fp8.c backend_vulkan.c backend_vulkan_dsv4.c \
+		$(VK_DQDQ_ORACLE_OBJ) -o tests/test_vk_dsv4_fp8 -lvulkan -lm -fopenmp -pthread -Wl,--gc-sections
+	./tests/test_vk_dsv4_fp8
+endif
 
 # dsv4 Vulkan op surface (M1-3 seam): same-named dsv4_cuda_* ABI over the
 # ds4vk_* implementation landing in M2-M3. Plain C, no ICD dependency — the
