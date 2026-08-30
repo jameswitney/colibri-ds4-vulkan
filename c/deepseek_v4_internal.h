@@ -771,6 +771,17 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine);
 void coli_v4_gpu_engine_close(ColiV4Engine *engine);
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights);
+/* M3d-1 (D7): the VK dense tier drops the resident fp8 RAM copies right
+ * after the VRAM upload (coli_v4_gpu_layer_post_upload, called from the
+ * resident loader) and reloads them ONCE if the tier fails mid-run, going
+ * to a permanent-CPU mode (no flip-flopping). coli_v4_gpu_tier_wanted is
+ * true only for the VK tier (the CUDA tier keeps dense resident in RAM);
+ * coli_v4_gpu_permanent_cpu is checked by the dispatch wrappers to stop
+ * touching the GPU. Implemented in the COLI_V4_UNIT_GPU unit. */
+int coli_v4_gpu_tier_wanted(void);
+void coli_v4_gpu_layer_post_upload(ColiV4Engine *engine, int layer,
+                                   ColiDeepSeekV4LayerWeights *weights);
+int coli_v4_gpu_permanent_cpu(void);
 int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
                            const float *input);
 int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,

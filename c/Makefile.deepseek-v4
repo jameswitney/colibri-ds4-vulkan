@@ -380,6 +380,22 @@ test-vk-dsv4-mhc: shaders/qmatmul.spv tests/test_dsv4_mhc_vk.c $(VK_OPS_ORACLE_O
 	./tests/test_dsv4_mhc_vk
 endif
 
+# L4 fault injection (TEST.md §4 / M3d gate): the COLI_DSV4_VK_FAIL hook
+# (backend_vulkan_dsv4.c) forces backend entries to fail so the D6 per-op
+# fallback is exercised deterministically — per-op isolation (fail=wo),
+# graceful upload degrade (fail=upload), unknown-group parse (fail=bogus),
+# multi-group (fail=wo,route) and a clean baseline. Each scenario runs in a
+# forked child (the fault mask is a process-static cache). The post-D7
+# reload + permanent-CPU mode is engine-side and is exercised on the real
+# checkpoint (L4 case 3, PROGRESS M3d-1).
+.PHONY: test-vk-dsv4-fallback
+ifeq ($(VK),1)
+test-vk-dsv4-fallback: shaders/qmatmul.spv tests/test_dsv4_vk_fallback.c
+	$(CC) -O2 -I. tests/test_dsv4_vk_fallback.c backend_vulkan.c backend_vulkan_dsv4.c \
+		-o tests/test_dsv4_vk_fallback -lvulkan -lm -fopenmp -pthread
+	./tests/test_dsv4_vk_fallback
+endif
+
 # dsv4 Vulkan op surface (M1-3 seam): same-named dsv4_cuda_* ABI over the
 # ds4vk_* implementation landing in M2-M3. Plain C, no ICD dependency — the
 # stub compiles and links on any box (TEST L0 seam completeness).

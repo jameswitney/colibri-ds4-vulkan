@@ -1,3 +1,5 @@
+#include <vulkan/vulkan.h>
+
 #ifndef COLIBRI_BACKEND_VULKAN_H
 #define COLIBRI_BACKEND_VULKAN_H
 
@@ -12,7 +14,24 @@ extern "C" {
  * mirroring backend_cuda.h. On Strix Halo the "upload" writes into
  * HOST_VISIBLE|DEVICE_LOCAL memory — same physical RAM the iGPU reads,
  * so there is no PCIe copy, unlike the discrete-CUDA path. */
-typedef struct ColiVkTensor ColiVkTensor;
+/* The arena-backed tensor handle. woff/soff are dsv4 grouped-wo_a view
+ * offsets (uint words / f32 scale slots) into the SAME arena buffers — the
+ * block-diagonal's per-group slices read directly (no per-group copies:
+ * host-visible VRAM reads over GTT are ~50 MB/s, measured ~600 ms/layer
+ * for the old copies). Views are stack copies with the offsets set. */
+typedef struct ColiVkTensor {
+    VkBuffer wbuf, sbuf;
+    VkDeviceMemory wmem, smem;
+    size_t wbytes;
+    int fmt, I, O, rowWords, gs;
+    int woff, soff;
+    int dev;
+    void *whost, *shost;
+} ColiVkTensor;
+/* Fill *out as an offset view of *base (same buffers; woff words / soff
+ * f32 scale slots). Returns 1 on success (base non-NULL). */
+int  coli_vk_tensor_view(const ColiVkTensor *base, int woff, int soff,
+                         ColiVkTensor *out);
 
 /* Bring up instance/device/queue/pipeline. Returns 1 on success.
  * spv_path points at the compiled qmatmul.spv. */

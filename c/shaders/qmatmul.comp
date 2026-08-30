@@ -11,47 +11,23 @@
 // 16=bf16 (dsv4 output head — two bf16 per word, no scale). Weights are a byte
 // buffer exposed as uint32 words; bytes/nibbles/planes are extracted manually.
 //
-// fmt=8 E4M3FN decode: 256-entry LUT as IEEE-754 bit patterns (intBitsToFloat),
-// generated from the CPU reference decode (deepseek_v4.c coli_e4m3fn_decode,
-// cross-checked byte-for-byte against quant.h E4M3_LUT). All values are exact
-// dyadic rationals, so the bit patterns are the exact fp32 results.
-const uint E4M3_BITS[256] = uint[256](
-    0x00000000u, 0x3b000000u, 0x3b800000u, 0x3bc00000u, 0x3c000000u, 0x3c200000u, 0x3c400000u, 0x3c600000u,
-    0x3c800000u, 0x3c900000u, 0x3ca00000u, 0x3cb00000u, 0x3cc00000u, 0x3cd00000u, 0x3ce00000u, 0x3cf00000u,
-    0x3d000000u, 0x3d100000u, 0x3d200000u, 0x3d300000u, 0x3d400000u, 0x3d500000u, 0x3d600000u, 0x3d700000u,
-    0x3d800000u, 0x3d900000u, 0x3da00000u, 0x3db00000u, 0x3dc00000u, 0x3dd00000u, 0x3de00000u, 0x3df00000u,
-    0x3e000000u, 0x3e100000u, 0x3e200000u, 0x3e300000u, 0x3e400000u, 0x3e500000u, 0x3e600000u, 0x3e700000u,
-    0x3e800000u, 0x3e900000u, 0x3ea00000u, 0x3eb00000u, 0x3ec00000u, 0x3ed00000u, 0x3ee00000u, 0x3ef00000u,
-    0x3f000000u, 0x3f100000u, 0x3f200000u, 0x3f300000u, 0x3f400000u, 0x3f500000u, 0x3f600000u, 0x3f700000u,
-    0x3f800000u, 0x3f900000u, 0x3fa00000u, 0x3fb00000u, 0x3fc00000u, 0x3fd00000u, 0x3fe00000u, 0x3ff00000u,
-    0x40000000u, 0x40100000u, 0x40200000u, 0x40300000u, 0x40400000u, 0x40500000u, 0x40600000u, 0x40700000u,
-    0x40800000u, 0x40900000u, 0x40a00000u, 0x40b00000u, 0x40c00000u, 0x40d00000u, 0x40e00000u, 0x40f00000u,
-    0x41000000u, 0x41100000u, 0x41200000u, 0x41300000u, 0x41400000u, 0x41500000u, 0x41600000u, 0x41700000u,
-    0x41800000u, 0x41900000u, 0x41a00000u, 0x41b00000u, 0x41c00000u, 0x41d00000u, 0x41e00000u, 0x41f00000u,
-    0x42000000u, 0x42100000u, 0x42200000u, 0x42300000u, 0x42400000u, 0x42500000u, 0x42600000u, 0x42700000u,
-    0x42800000u, 0x42900000u, 0x42a00000u, 0x42b00000u, 0x42c00000u, 0x42d00000u, 0x42e00000u, 0x42f00000u,
-    0x43000000u, 0x43100000u, 0x43200000u, 0x43300000u, 0x43400000u, 0x43500000u, 0x43600000u, 0x43700000u,
-    0x43800000u, 0x43900000u, 0x43a00000u, 0x43b00000u, 0x43c00000u, 0x43d00000u, 0x43e00000u, 0x7fc00000u,
-    0x80000000u, 0xbb000000u, 0xbb800000u, 0xbbc00000u, 0xbc000000u, 0xbc200000u, 0xbc400000u, 0xbc600000u,
-    0xbc800000u, 0xbc900000u, 0xbca00000u, 0xbcb00000u, 0xbcc00000u, 0xbcd00000u, 0xbce00000u, 0xbcf00000u,
-    0xbd000000u, 0xbd100000u, 0xbd200000u, 0xbd300000u, 0xbd400000u, 0xbd500000u, 0xbd600000u, 0xbd700000u,
-    0xbd800000u, 0xbd900000u, 0xbda00000u, 0xbdb00000u, 0xbdc00000u, 0xbdd00000u, 0xbde00000u, 0xbdf00000u,
-    0xbe000000u, 0xbe100000u, 0xbe200000u, 0xbe300000u, 0xbe400000u, 0xbe500000u, 0xbe600000u, 0xbe700000u,
-    0xbe800000u, 0xbe900000u, 0xbea00000u, 0xbeb00000u, 0xbec00000u, 0xbed00000u, 0xbee00000u, 0xbef00000u,
-    0xbf000000u, 0xbf100000u, 0xbf200000u, 0xbf300000u, 0xbf400000u, 0xbf500000u, 0xbf600000u, 0xbf700000u,
-    0xbf800000u, 0xbf900000u, 0xbfa00000u, 0xbfb00000u, 0xbfc00000u, 0xbfd00000u, 0xbfe00000u, 0xbff00000u,
-    0xc0000000u, 0xc0100000u, 0xc0200000u, 0xc0300000u, 0xc0400000u, 0xc0500000u, 0xc0600000u, 0xc0700000u,
-    0xc0800000u, 0xc0900000u, 0xc0a00000u, 0xc0b00000u, 0xc0c00000u, 0xc0d00000u, 0xc0e00000u, 0xc0f00000u,
-    0xc1000000u, 0xc1100000u, 0xc1200000u, 0xc1300000u, 0xc1400000u, 0xc1500000u, 0xc1600000u, 0xc1700000u,
-    0xc1800000u, 0xc1900000u, 0xc1a00000u, 0xc1b00000u, 0xc1c00000u, 0xc1d00000u, 0xc1e00000u, 0xc1f00000u,
-    0xc2000000u, 0xc2100000u, 0xc2200000u, 0xc2300000u, 0xc2400000u, 0xc2500000u, 0xc2600000u, 0xc2700000u,
-    0xc2800000u, 0xc2900000u, 0xc2a00000u, 0xc2b00000u, 0xc2c00000u, 0xc2d00000u, 0xc2e00000u, 0xc2f00000u,
-    0xc3000000u, 0xc3100000u, 0xc3200000u, 0xc3300000u, 0xc3400000u, 0xc3500000u, 0xc3600000u, 0xc3700000u,
-    0xc3800000u, 0xc3900000u, 0xc3a00000u, 0xc3b00000u, 0xc3c00000u, 0xc3d00000u, 0xc3e00000u, 0x7fc00000u
-);
+// fmt=8 E4M3FN decode: inline arithmetic (sign/exponent/mantissa), the same
+// decode as the CUDA tier's e4m3() (backend_cuda_dsv4.cu) and the CPU reference
+// (coli_e4m3fn_decode): value = (-1)^sign * 2^(e-7) * (1 + m/8) for normal
+// codes, m*2^-9 subnormals, +-inf at e=15 (m==7 NaN). All values are exact
+// dyadic rationals, so arithmetic and the old 256-entry bit-pattern LUT agree
+// bit-for-bit — but a data-dependent LUT gather collapses VRAM read bandwidth
+// on RADV (~1.5 GB/s measured vs 265+ GB/s for the arithmetic fmt=16 path:
+// the LUT lives in memory and every decoded byte becomes a gather), so the
+// arithmetic form is used.
 float e4m3(uint word, int lane) {
     uint b = (word >> (uint(lane) * 8u)) & 0xffu;
-    return intBitsToFloat(int(E4M3_BITS[b]));
+    uint sign = b >> 7u, e = (b >> 3u) & 0xfu, m = b & 7u;
+    float v;
+    if (e == 0u) v = ldexp(float(m), -9);
+    else if (e == 15u) v = (m == 7u) ? (0.0f / 0.0f) : ldexp(1.0f + float(m) / 8.0f, 8);
+    else v = ldexp(1.0f + float(m) / 8.0f, int(e) - 7);
+    return sign != 0u ? -v : v;
 }
 //
 // Optimized decode (S=1) GEMV, techniques adapted from llama.cpp's mul_mat_vec
@@ -77,6 +53,8 @@ layout(push_constant) uniform P {
     int S, I, O;
     int rowWords;   // uint32 words per weight row
     int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
+    int woff;       // weight word offset (dsv4 grouped wo_a: slice of the block-diagonal)
+    int soff;       // scale float offset (same slice)
 } p;
 
 // Max hidden dim across GLM expert matmuls is 6144 (24 KB LDS); down-proj uses 2048.
@@ -130,7 +108,7 @@ void main() {
     int stride  = int(gl_NumWorkGroups.x) * nsg;      // grid-stride over output rows
 
     for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
-        uint rowBase = uint(o) * uint(p.rowWords);
+        uint rowBase = uint(p.woff) + uint(o) * uint(p.rowWords);
         float sum = 0.0;
         if (p.fmt == 1) {
             int words = (p.I + 3) / 4;
@@ -165,7 +143,7 @@ void main() {
             // all 16 values of one low word share a group, so its scale multiplies the
             // 16-wide partial directly and the per-row scale at the end must NOT run.
             int ng = (p.I + 63) >> 6;
-            uint sb = uint(o) * uint(ng);
+            uint sb = uint(p.soff) + uint(o) * uint(ng);
             for (int m = lane; m < ng * 4; m += sgsize) {
                 int g = m >> 2, mw = m & 3;                   // group, low-word within group
                 uint blo = w[rowBase + uint(g) * 6u + uint(mw)];
@@ -186,7 +164,7 @@ void main() {
             // (o/128)*ceil(I/128)+i/128; a word (4 bytes) never straddles a 128-block,
             // so the block's scale multiplies the word's 4-wide partial (like fmt 4/7).
             int words = (p.I + 3) / 4, nb = (p.I + 127) / 128;
-            uint sb = uint(o / 128) * uint(nb);
+            uint sb = uint(p.soff) + uint(o / 128) * uint(nb);
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
                 float a = 0.0;
@@ -205,7 +183,7 @@ void main() {
             // packed word never straddles a group and its scale multiplies the 8-wide
             // partial. Per-row scale must NOT run.
             int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
-            uint sb = uint(o) * uint(ng);
+            uint sb = uint(p.soff) + uint(o) * uint(ng);
             for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
                 float a = 0.0;

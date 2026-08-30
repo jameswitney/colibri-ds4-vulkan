@@ -858,7 +858,23 @@ int coli_v4_layer_load(ColiV4Engine *engine,
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
         size_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
             ? (size_t)tensor->numel * sizeof(float) : (size_t)tensor->nbytes;
+#if defined(COLI_V4_GPU_TIER_VK)
+        /* M3d-1 (D7): the VK tier returns the resident fp8 weight RAM to the
+         * OS after the VRAM upload (madvise(MADV_DONTNEED), keeping the
+         * mapping for the one-time reload) — the drop requires page-aligned,
+         * whole-page buffers. Plain malloc returns mmap'd large chunks at a
+         * 16-byte offset from a page boundary (glibc chunk header), which
+         * silently skipped the drop (measured: 0 of 344 tensors);
+         * posix_memalign makes every resident tensor page-aligned so the D7
+         * drop fires for the hooked fp8 weights. CUDA/CPU builds keep the
+         * upstream malloc (L0 byte-parity). free() matches posix_memalign. */
+        void *data_buf = NULL;
+        if (posix_memalign(&data_buf, 4096, resident_bytes) != 0)
+            data_buf = NULL;
+        weights->data[i] = data_buf;
+#else
         weights->data[i] = malloc(resident_bytes);
+#endif
         if (!weights->data[i]) {
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
@@ -981,6 +997,16 @@ int coli_v4_layer_load(ColiV4Engine *engine,
                                      &engine->dense_resident.layers[layer]) < 0)
             fprintf(stderr, "v4_gpu warning=layer-%d-upload-failed; "
                             "continuing-CPU\n", layer);
+        else
+            /* M3d-1 (D7): once the VRAM upload succeeded, the resident fp8
+             * weight RAM copies can be freed — VRAM is the source of truth
+             * and the freed bytes flow to the expert LRU cache (the RAM
+             * budget re-derivation in the RUNTIME planner already handed
+             * them over). Only tensors with a live GPU handle are dropped;
+             * the first tier failure afterwards reloads them once and the
+             * tier goes permanent-CPU (see the GPU unit). */
+            coli_v4_gpu_layer_post_upload(engine, layer,
+                                          &engine->dense_resident.layers[layer]);
 #endif
         engine->dense_resident.ready[layer] = 1;
         engine->dense_resident.total_bytes +=
@@ -1161,7 +1187,7 @@ int coli_v4_resident_tier_plan(
     const ColiDeepSeekV4ResidentTierInputs *inputs,
     char *error, size_t error_size) {
     if (!plan || !inputs || !inputs->available_bytes ||
-        !inputs->dense_bytes || !inputs->minimum_expert_bytes)
+        !inputs->minimum_expert_bytes)
         return plan_error(error, error_size,
                           "invalid V4 resident-tier inputs");
     memset(plan, 0, sizeof(*plan));
@@ -1171,7 +1197,12 @@ int coli_v4_resident_tier_plan(
         return plan_error(error, error_size,
                           "resident V4 tiers leave too little target cache");
 
-    if (resident_tiers_fit(inputs->available_bytes, inputs->fixed_bytes,
+    /* dense_bytes == 0 (M3d-1/D7, VK tier): no dense RAM reservation was
+     * requested — the VK build drops the resident copy right after the VRAM
+     * upload, so the fit is vacuous; resident loading is still wanted (the
+     * upload path lives in the resident loader). */
+    if (inputs->dense_bytes == 0 ||
+        resident_tiers_fit(inputs->available_bytes, inputs->fixed_bytes,
                            inputs->dense_bytes,
                            inputs->minimum_expert_bytes)) {
         plan->dense_resident = 1;
@@ -1405,6 +1436,21 @@ int coli_v4_expert_store_open_planned(
     uint64_t dense_bytes = 0;
     if (build_runtime_plan(engine, options, &plan, &dense_bytes,
                            error, error_size)) return -1;
+#ifdef COLI_V4_GPU_TIER
+    /* M3d-1 (D7): with the VK dense tier active, the resident dense fp8 RAM
+     * copy is dropped right after the VRAM upload (coli_v4_gpu_layer_post_upload),
+     * so the RAM plan may give the expert LRU cache the dense bytes (measured
+     * ~7.3 GiB dense+head on the real checkpoint — the PIN_GB=8-class win). If
+     * the tier fails mid-run, the one-time reload re-takes that RAM and the
+     * tier goes permanent-CPU (no flip-flopping). CUDA tier: kept resident,
+     * dense_bytes stays (coli_v4_gpu_tier_wanted returns 0 there). */
+    if (coli_v4_gpu_tier_wanted()) {
+        fprintf(stderr, "ram_tiers vk-dense: D7 drop active — dense RAM budget "
+                        "(%.2f GiB) moves to the expert cache\n",
+                dense_bytes / (double)GIB);
+        dense_bytes = 0;
+    }
+#endif
     uint64_t per_slot = plan.expert_cache_bytes /
                         (uint64_t)plan.slots_per_layer;
     uint64_t head_bytes = 0;
@@ -1873,7 +1919,12 @@ static int fp8_view(ColiTensorView *view,
     const void *data = layer_data(weights, suffix, &weight_spec);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = layer_data(weights, suffix, &scale_spec);
-    if (!data || !scales || !weight_spec || !scale_spec ||
+    /* M3d-1/D7: the resident fp8 weight RAM is dropped after the VRAM
+     * upload — data may be NULL while the GPU handle exists; the view still
+     * resolves for the mirror-driven dispatch (the CPU fallback is preceded
+     * by the one-time reload). */
+    if ((!data || !scales) && !coli_v4_layer_gpu(weights, prefix)) return -1;
+    if (!weight_spec || !scale_spec ||
         weight_spec->dtype != COLI_ST_F8_E4M3 ||
         scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
         return -1;
@@ -2154,6 +2205,11 @@ static int attention_token_impl(float *output,
 #endif
         for (int group = 0; group < groups; group++) {
             ColiTensorView group_view = wo_a;
+            /* M3d-1: the reshaped sub-view must not carry the full-matrix
+             * backend handle (wrong-shape dispatch) — same fix as the
+             * batched path; this fallback runs when the grouped matvec
+             * refused, possibly with a live handle. */
+            group_view.gpu = NULL;
             group_view.rows = o_rank;
             group_view.columns = group_width;
             group_view.data = (const uint8_t *)wo_a.data +
@@ -2339,7 +2395,12 @@ static int fp8_view(ColiTensorView *view,
     const void *data = layer_data(weights, suffix, &weight_spec);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = layer_data(weights, suffix, &scale_spec);
-    if (!data || !scales || !weight_spec || !scale_spec ||
+    /* M3d-1/D7: the resident fp8 weight RAM is dropped after the VRAM
+     * upload — data may be NULL while the GPU handle exists; the view still
+     * resolves for the mirror-driven dispatch (the CPU fallback is preceded
+     * by the one-time reload). */
+    if ((!data || !scales) && !coli_v4_layer_gpu(weights, prefix)) return -1;
+    if (!weight_spec || !scale_spec ||
         weight_spec->dtype != COLI_ST_F8_E4M3 ||
         scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
         return -1;
@@ -2565,6 +2626,11 @@ static int attention_token_impl(float *output,
 #endif
         for (int group = 0; group < groups; group++) {
             ColiTensorView group_view = wo_a;
+            /* M3d-1: the reshaped sub-view must not carry the full-matrix
+             * backend handle (wrong-shape dispatch) — same fix as the
+             * batched path; this fallback runs when the grouped matvec
+             * refused, possibly with a live handle. */
+            group_view.gpu = NULL;
             group_view.rows = o_rank;
             group_view.columns = group_width;
             group_view.data = (const uint8_t *)wo_a.data +
@@ -3096,9 +3162,9 @@ int coli_v4_attention_window_batch_ref(
         /* The struct copy drags wo_a's Dsv4CudaTensor handle into a RESHAPED
          * sub-view (one group's o_rank x group_width slice at an offset), but
          * the mirror on the GPU is the FULL matrix: letting the batch matmul
-         * dispatch through it computes the wrong shape entirely. The decode
-         * path never hits this — its group_view fallback only runs when
-         * wo_a.gpu is already NULL. */
+         * dispatch through it computes the wrong shape entirely (the
+         * decode/serial/transaction fallbacks got the same NULL fix,
+         * M3d-1). */
         group_view.gpu = NULL;
         group_view.rows = o_rank;
         group_view.columns = group_width;
@@ -3493,7 +3559,9 @@ static int fp8_view(ColiTensorView *view,
     const void *data = value(weights, suffix, &ws);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = value(weights, suffix, &ss);
-    if (!data || !scales || !ws || !ss || ws->rank != 2 ||
+    /* M3d-1/D7: see the layer_data-based fp8_view — data may be NULL post-drop. */
+    if ((!data || !scales) && !coli_v4_layer_gpu(weights, prefix)) return -1;
+    if (!ws || !ss || ws->rank != 2 ||
         ws->dtype != COLI_ST_F8_E4M3 || ss->dtype != COLI_ST_F8_E8M0)
         return -1;
     *view = (ColiTensorView){
@@ -4235,7 +4303,9 @@ static int fp8_view(ColiTensorView *view,
     const void *data = value(weights, name, &ws);
     snprintf(name, sizeof(name), "%s.scale", prefix);
     const void *scales = value(weights, name, &ss);
-    if (!data || !scales || !ws || !ss || ws->rank != 2) return -1;
+    /* M3d-1/D7: see the layer_data-based fp8_view — data may be NULL post-drop. */
+    if ((!data || !scales) && !coli_v4_layer_gpu(weights, prefix)) return -1;
+    if (!ws || !ss || ws->rank != 2) return -1;
     *view = (ColiTensorView){
         COLI_TENSOR_FP8_E4M3_BLOCK, COLI_SCALE_F32, data, scales,
         (size_t)(ws->shape[0] * ws->shape[1]),
@@ -5694,7 +5764,7 @@ static int v4_moe_batch_union(
             raw_gate, bias,
             weights->plan.uses_hash_router ? item_indices : NULL,
             n, d, topk, config->routed_scaling_factor);
-#else
+    #else
         result = coli_v4_route(
             item_weights, item_indices, inputs + (size_t)item * d,
             gate, bias,
@@ -5769,12 +5839,13 @@ static int v4_moe_batch_union(
             else
                 active[slot] = 1;
         }
-        if (!result)
+        if (!result) {
             result = v4_apply_expert_batch(
                 outputs, store, &view, inputs, indices, route_weights,
                 batch, topk, d, config->swiglu_limit, expert_inputs,
                 expert_weights, expert_items, expert_outputs,
                 expert_batch_capacity);
+                }
         coli_expert_release(store, &view);
     }
     for (int slot = 0; slot < dual_loader_lanes(); slot++)
@@ -6434,7 +6505,9 @@ static int fp8_view(ColiTensorView *view,
     const void *data = value(weights, suffix, &ws);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = value(weights, suffix, &ss);
-    if (!data || !scales || !ws || !ss || ws->rank != 2 ||
+    /* M3d-1/D7: see the layer_data-based fp8_view — data may be NULL post-drop. */
+    if ((!data || !scales) && !coli_v4_layer_gpu(weights, prefix)) return -1;
+    if (!ws || !ss || ws->rank != 2 ||
         ws->dtype != COLI_ST_F8_E4M3 || ss->dtype != COLI_ST_F8_E8M0)
         return -1;
     *view = (ColiTensorView){
@@ -6915,7 +6988,12 @@ static int fp8_view(ColiTensorView *view,
     const void *data = layer_data(weights, suffix, &weight_spec);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = layer_data(weights, suffix, &scale_spec);
-    if (!data || !scales || !weight_spec || !scale_spec ||
+    /* M3d-1/D7: the resident fp8 weight RAM is dropped after the VRAM
+     * upload — data may be NULL while the GPU handle exists; the view still
+     * resolves for the mirror-driven dispatch (the CPU fallback is preceded
+     * by the one-time reload). */
+    if ((!data || !scales) && !coli_v4_layer_gpu(weights, prefix)) return -1;
+    if (!weight_spec || !scale_spec ||
         weight_spec->dtype != COLI_ST_F8_E4M3 ||
         scale_spec->dtype != COLI_ST_F8_E8M0 || weight_spec->rank != 2)
         return -1;
@@ -7141,6 +7219,11 @@ static int attention_token_impl(float *output,
 #endif
         for (int group = 0; group < groups; group++) {
             ColiTensorView group_view = wo_a;
+            /* M3d-1: the reshaped sub-view must not carry the full-matrix
+             * backend handle (wrong-shape dispatch) — same fix as the
+             * batched path; this fallback runs when the grouped matvec
+             * refused, possibly with a live handle. */
+            group_view.gpu = NULL;
             group_view.rows = o_rank;
             group_view.columns = group_width;
             group_view.data = (const uint8_t *)wo_a.data +
@@ -9771,11 +9854,209 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 
+/* ---- M3d-1 (D7): dense-RAM drop + one-time reload + permanent-CPU mode ----
+ *
+ * With the VK tier active, the resident fp8 weight RAM copies are returned
+ * to the OS once their bytes are in the Vulkan arenas
+ * (coli_v4_gpu_layer_post_upload, called from the resident loader right after
+ * each layer's upload): madvise(MADV_DONTNEED) drops the anonymous pages while
+ * KEEPING THE MAPPINGS, so the pointers in every ColiTensorView stay valid
+ * and the one-time reload simply re-reads into the same buffers — no stale-
+ * view hazard. The tier then runs on VRAM-only weights and the freed RAM
+ * flows to the expert LRU cache (the RUNTIME planner re-derives the budget
+ * with dense_bytes = 0). The first backend failure AFTER the drop must
+ * (a) reload the dropped RAM once from the checkpoint and (b) switch the
+ * tier to a PERMANENT-CPU mode — never flip-flop (D6/D7). g_vk_engine is the
+ * process-singleton engine the loader uses for the reload (index + model
+ * dir); the engine is single-instance in every supported use.
+ *
+ * Only tensors whose allocation is page-aligned AND a whole number of pages
+ * are dropped (the real checkpoint's fp8 weights are large mmap'd buffers, so
+ * they qualify; small heap tensors stay resident — a partial-page madvise
+ * would corrupt neighbouring allocations). The drop is suppressed while
+ * COLI_DSV4_VK_OPS per-op gating is in use (TEST §0.5 L3 A/B isolation): a
+ * deliberately-refused op must fall back to CPU with its RAM still present,
+ * so A/B runs keep the full resident set. Before the drop (or under gating),
+ * op failures are plain per-op fallbacks (D6) and never trigger the reload.
+ * IMPORTANT: a CPU fallback that reads a dropped tensor BEFORE the reload
+ * sees zero pages — every such fallback is preceded by the reload via the
+ * dispatch wrappers below (coli_v4_gpu_fp8_matvec/_grouped/_matmul_batch,
+ * route/head/attn/mHC failure hooks). */
+#if defined(COLI_V4_GPU_TIER_VK)
+#include <sys/mman.h>
+static ColiV4Engine *g_vk_engine;
+static unsigned char g_vk_ram_dropped[COLI_V4_RESIDENT_MAX_LAYERS];
+static uint64_t g_vk_dropped_mask[COLI_V4_RESIDENT_MAX_LAYERS];
+static int g_vk_any_dropped;
+static int g_vk_perm_cpu;
+
+/* rows8 pack (mirror of the resident loader's v4_fp8_pack_rows8_inplace — a
+ * different TU; the byte layout is the AVX2 decode contract). Only used by
+ * the one-time reload, so the scalar port is fine (the AVX2 original exists
+ * for the hot load path, which is unchanged). */
+static int v4_vk_pack_rows8(unsigned char *data, int64_t rows, int64_t columns) {
+    if (!data || rows < 8 || rows % 8 || columns < 128 || columns % 128)
+        return 0;
+    size_t tile_bytes = (size_t)8 * (size_t)columns;
+    unsigned char *scratch = malloc(tile_bytes);
+    if (!scratch) return -1;
+    for (int64_t tile = 0; tile < rows / 8; tile++) {
+        unsigned char *target = data + (size_t)tile * tile_bytes;
+        memcpy(scratch, target, tile_bytes);
+        /* 8xN byte transpose: row-major tile -> column-major, identical byte
+         * order to the loader's AVX2 three-unpack stages. */
+        for (int64_t column = 0; column < columns; column += 16)
+            for (int64_t r = 0; r < 8; r++)
+                for (int64_t c = 0; c < 16; c++)
+                    target[(size_t)(column + c) * 8 + r] =
+                        scratch[(size_t)r * columns + column + c];
+    }
+    free(scratch);
+    return 1;
+}
+
+/* Return one resident fp8 weight buffer's pages to the OS (D7). Only when
+ * the allocation is page-aligned and a whole number of pages — the mapping
+ * is KEPT, so the pointer stays valid for the one-time reload (and any view
+ * built from it never dangles). Small heap tensors (not page-aligned)
+ * simply stay resident: a partial-page madvise would drop the neighbours. */
+static int v4_vk_drop_one(void *buf, size_t bytes) {
+#if defined(__linux__)
+    if (buf && bytes >= 4096 && ((uintptr_t)buf & 4095) == 0 &&
+        (bytes & 4095) == 0)
+        return madvise(buf, bytes, MADV_DONTNEED) == 0;
+#else
+    (void)buf; (void)bytes;
+#endif
+    return 0;
+}
+
+/* Return the resident fp8 weight RAM to the OS for the tensors whose VRAM
+ * upload succeeded (gpu[i] != NULL). Only the 8 hooked fp8 weights drop;
+ * scales, norms, sinks, hc_* mirrors and the bf16 route gate stay resident —
+ * their CPU consumers (coli_fp8_matvec_ref, coli_v4_route_bf16, mHC,
+ * indexer) must keep working post-reload, and the reload below only restores
+ * the dropped tensors. */
+void coli_v4_gpu_layer_post_upload(ColiV4Engine *engine, int layer,
+                                   ColiDeepSeekV4LayerWeights *weights) {
+    if (!engine || !weights || g_vk_perm_cpu) return;
+    if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return;
+    const char *ops = getenv("COLI_DSV4_VK_OPS");
+    if (ops && *ops) return;   /* A/B isolation: keep RAM for CPU fallbacks */
+    static const char *const tensors[] = {
+        "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
+        "ffn.shared_experts.w1", "ffn.shared_experts.w2",
+        "ffn.shared_experts.w3"
+    };
+    long long freed = 0;
+    int dropped = 0;
+    for (size_t t = 0; t < sizeof(tensors) / sizeof(tensors[0]); t++) {
+        char name[COLI_V4_MAX_TENSOR_NAME];
+        snprintf(name, sizeof(name), "layers.%d.%s.weight", layer, tensors[t]);
+        for (size_t i = 0; i < weights->plan.tensor_count; i++) {
+            if (strcmp(weights->plan.tensors[i].name, name) != 0) continue;
+            if (weights->gpu[i] && weights->data[i]) {
+                const ColiDeepSeekV4TensorSpec *spec = &weights->plan.tensors[i];
+                size_t bytes = (size_t)(spec->shape[0] * spec->shape[1]);
+                if (v4_vk_drop_one(weights->data[i], bytes)) {
+                    g_vk_dropped_mask[layer] |= UINT64_C(1) << i;
+                    freed += (long long)bytes;
+                    dropped++;
+                }
+            }
+            break;
+        }
+    }
+    if (dropped) {
+        g_vk_ram_dropped[layer] = 1;
+        g_vk_any_dropped = 1;
+        fprintf(stderr, "v4_gpu vk D7: layer=%d dense fp8 RAM returned to OS "
+                        "(%d tensors, %.1f MiB; VRAM is the source of truth)\n",
+                layer, dropped, freed / 1048576.0);
+    }
+}
+
+/* Restore the dropped tensors' RAM (one-time, on the first VK failure after
+ * the drop). Re-reads into the SAME buffers (the mappings were kept by
+ * madvise) and re-packs rows8 exactly like the resident loader did — every
+ * existing ColiTensorView is immediately valid again. */
+static int v4_vk_dense_reload(ColiV4Engine *engine) {
+    if (!engine || !engine->target_index) return -1;
+    long long reloaded = 0;
+    int restored = 0;
+    for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
+        if (!g_vk_ram_dropped[layer]) continue;
+        ColiDeepSeekV4LayerWeights *w = &engine->dense_resident.layers[layer];
+        if (!w) return -1;
+        for (size_t i = 0; i < w->plan.tensor_count; i++) {
+            if (!((g_vk_dropped_mask[layer] >> i) & 1)) continue;
+            if (!w->data[i] || !w->gpu[i]) return -1;
+            const ColiDeepSeekV4TensorSpec *spec = &w->plan.tensors[i];
+            if (spec->dtype != COLI_ST_F8_E4M3 || spec->rank != 2) return -1;
+            size_t bytes = (size_t)(spec->shape[0] * spec->shape[1]);
+            const ColiSafetensorsTensor *t =
+                coli_st_find(engine->target_index, spec->name);
+            if (!t) return -1;
+            if (coli_st_read_tensor(engine->target_index, t, w->data[i]))
+                return -1;
+            if (spec->packed_rows8 &&
+                v4_vk_pack_rows8(w->data[i], spec->shape[0], spec->shape[1]) < 0)
+                return -1;
+            reloaded += (long long)bytes;
+            restored++;
+        }
+    }
+    fprintf(stderr, "v4_gpu vk D7 reload: %d tensors, %.2f GiB restored to RAM\n",
+            restored, reloaded / 1073741824.0);
+    return restored ? 0 : -1;
+}
+
+/* First VK failure after the D7 drop: reload the dropped RAM once and go to
+ * a permanent CPU mode (no flip-flopping). Before the drop (or under
+ * COLI_DSV4_VK_OPS), failures are plain per-op CPU fallbacks (D6). */
+static void v4_vk_on_op_failure(void) {
+    if (!g_vk_any_dropped || g_vk_perm_cpu) return;
+    g_vk_perm_cpu = 1;
+    struct timespec _t0; clock_gettime(CLOCK_MONOTONIC, &_t0);
+    if (g_vk_engine && v4_vk_dense_reload(g_vk_engine) == 0) {
+        struct timespec _t1; clock_gettime(CLOCK_MONOTONIC, &_t1);
+        double dt = (_t1.tv_sec - _t0.tv_sec) +
+                    (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+        fprintf(stderr, "v4_gpu vk warning: first GPU failure after the D7 "
+                        "dense-RAM drop — dense reloaded once (%.2fs); "
+                        "tier=permanent-CPU, no further GPU ops\n", dt);
+    } else {
+        fprintf(stderr, "v4_gpu vk CRITICAL: dense RAM reload FAILED after the "
+                        "first GPU failure; CPU fallbacks may read freed memory\n");
+    }
+}
+int coli_v4_gpu_tier_wanted(void) { return v4_gpu_wanted(); }
+int coli_v4_gpu_permanent_cpu(void) { return g_vk_perm_cpu; }
+#else
+int coli_v4_gpu_tier_wanted(void) { return 0; }   /* CUDA keeps dense in RAM */
+void coli_v4_gpu_layer_post_upload(ColiV4Engine *engine, int layer,
+                                   ColiDeepSeekV4LayerWeights *weights) {
+    (void)engine; (void)layer; (void)weights;
+}
+int coli_v4_gpu_permanent_cpu(void) { return 0; }
+static void v4_vk_on_op_failure(void) { }
+#endif /* COLI_V4_GPU_TIER_VK */
+
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
     if (!v4_gpu_wanted()) return 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+    /* M3d-1 (D7) state: a fresh engine starts with the resident RAM intact;
+     * the drop happens per-layer after upload, the reload+permanent-CPU once
+     * on the first failure. g_vk_engine is the reload's index/config source. */
+    g_vk_engine = engine;
+    memset(g_vk_ram_dropped, 0, sizeof(g_vk_ram_dropped));
+    memset(g_vk_dropped_mask, 0, sizeof(g_vk_dropped_mask));
+    g_vk_any_dropped = 0;
+    g_vk_perm_cpu = 0;
+#endif
     const char *device_setting = getenv("DSV4_CUDA_DEVICE");
     int device = device_setting ? atoi(device_setting) : 0;
     if (!dsv4_cuda_init(&device, 1)) {
@@ -9866,6 +10147,11 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+    g_vk_engine = NULL;
+    g_vk_any_dropped = 0;
+    g_vk_perm_cpu = 0;
+#endif
 }
 
 /* ---- M3a head mirror + argmax dispatch (VK tier) ----
@@ -9902,7 +10188,10 @@ static void v4_vk_head_upload(ColiV4Engine *engine) {
 int coli_v4_gpu_head_argmax(const float *hidden, int *id, float *value) {
 #if defined(COLI_V4_GPU_TIER_VK)
     if (!g_vk_head || !hidden || !id || !value) return -1;
-    return dsv4_cuda_head_argmax(g_vk_head, hidden, id, value) ? 0 : -1;
+    if (g_vk_perm_cpu) return -1;
+    if (dsv4_cuda_head_argmax(g_vk_head, hidden, id, value)) return 0;
+    v4_vk_on_op_failure();
+    return -1;
 #else
     (void)hidden; (void)id; (void)value;
     return -1;
@@ -10271,15 +10560,23 @@ int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
                            const float *input) {
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor) return -1;
-    return dsv4_cuda_matvec(tensor, output, (float *)input) ? 0 : -1;
+    if (coli_v4_gpu_permanent_cpu()) return -1;
+    if (dsv4_cuda_matvec(tensor, output, (float *)input)) return 0;
+    /* M3d-1 (D7): first backend failure after the RAM drop -> reload once +
+     * permanent-CPU; the caller then computes on the restored RAM. */
+    v4_vk_on_op_failure();
+    return -1;
 }
 
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
                                const float *input, int groups) {
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor || groups < 1) return -1;
-    return dsv4_cuda_matvec_grouped(tensor, output, (float *)input, groups)
-        ? 0 : -1;
+    if (coli_v4_gpu_permanent_cpu()) return -1;
+    if (dsv4_cuda_matvec_grouped(tensor, output, (float *)input, groups))
+        return 0;
+    v4_vk_on_op_failure();
+    return -1;
 }
 
 /* Prefill batch matmul through the resident mirrors. A 64-token chunk moves a
@@ -10296,6 +10593,7 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
     static int mirror_device = -1;
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor || batch < 1) return -1;
+    if (coli_v4_gpu_permanent_cpu()) return -1;
     int device = dsv4_cuda_tensor_device(tensor);
     long long in_elements = (long long)batch * w->columns;
     long long out_elements = (long long)batch * w->rows;
@@ -10320,8 +10618,13 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
     if (!dsv4_cuda_activation_upload(input_mirror, inputs, in_elements) ||
         !dsv4_cuda_matmul_batch(tensor, input_mirror, batch, output_mirror) ||
         !dsv4_cuda_activation_download(outputs, output_mirror, out_elements) ||
-        !dsv4_cuda_activation_sync(output_mirror))
+        !dsv4_cuda_activation_sync(output_mirror)) {
+        /* M3d-1 (D7): the batch matmul is a real v1 op (the M3d enabler —
+         * its CPU fallback reads the dropped weight RAM), so a failure here
+         * is a genuine wedge: reload once + permanent-CPU. */
+        v4_vk_on_op_failure();
         return -1;
+    }
     return 0;
 }
 
@@ -10332,6 +10635,7 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
     if (!route_weights || !indices || !input || !weights) return -1;
     /* The backend route kernel is hardwired to 256 experts / top-k 6. */
     if (experts != 256 || topk != 6 || dimension < 1) return -1;
+    if (coli_v4_gpu_permanent_cpu()) return -1;
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias_t = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
     if (!gate || (bias && !bias_t)) return -1;
@@ -10345,7 +10649,10 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
     if (ok) ok = dsv4_cuda_route(act, gate, bias ? bias_t : NULL,
                                  forced_indices, route_scale, ids, wts);
     dsv4_cuda_activation_free(act);
-    if (!ok) return -1;
+    if (!ok) {
+        v4_vk_on_op_failure();
+        return -1;
+    }
     for (int k = 0; k < topk; k++) {
         indices[k] = ids[k];
         route_weights[k] = wts[k];
@@ -11196,6 +11503,11 @@ int coli_v4_gpu_attn_batch_wanted(void) {
         if (!wanted && v4_gpu_wanted()) wanted = 1;
 #endif
     }
+#if defined(COLI_V4_GPU_TIER_VK)
+    /* M3d-1 (D7): permanent-CPU mode after the first post-drop failure — the
+     * decode/batch GPU blocks stop engaging and run the CPU references. */
+    if (g_vk_perm_cpu) return 0;
+#endif
     return wanted;
 }
 
@@ -11355,6 +11667,12 @@ int coli_v4_gpu_sparse_attention_batch_cached(
     if (!anchor) return -1;
     int device = dsv4_cuda_tensor_device(anchor);
     if (device < 0) return -1;
+    /* D6 note (M3d-1): NO v4_vk_on_op_failure here. The prefill/batch
+     * attention is expected to fall back to CPU in v1 (the device KV ring
+     * is only seeded by the decode path; the batch unit is M4), and its CPU
+     * fallback reads only KV state — never the D7-dropped weight RAM — so a
+     * refusal must be a plain per-op fallback, not a wedge (a reload on the
+     * first prefill chunk would kill the tier before decode every run). */
     return dsv4_cuda_sparse_attn_batch_cached(
         device, weights->plan.layer, q, chunk, chunk_start, sinks, meta,
         abs_base, comp_limit, heads, head_dim, batch,
@@ -11375,9 +11693,10 @@ int coli_v4_gpu_sparse_attention_batch_cached_idx(
     if (!anchor) return -1;
     int device = dsv4_cuda_tensor_device(anchor);
     if (device < 0) return -1;
+    /* D6 note (M3d-1): no reload hook here either — see the cached variant. */
     return dsv4_cuda_sparse_attn_batch_cached_idx(
-        device, weights->plan.layer, q, chunk, chunk_start, sinks, meta, sel,
-        selstride, abs_base, comp_limit, heads, head_dim, batch,
+        device, weights->plan.layer, q, chunk, chunk_start, sinks, meta,
+        sel, selstride, abs_base, comp_limit, heads, head_dim, batch,
         1.0f / sqrtf((float)head_dim), attended)
         ? 0 : -1;
 }
@@ -11456,8 +11775,12 @@ int coli_v4_gpu_attention_wo_batch(
         !dsv4_cuda_attention_output_batch(context_mirror, wa, wb, groups,
                                           batch, output_mirror) ||
         !dsv4_cuda_activation_download(outputs, output_mirror, out_elements) ||
-        !dsv4_cuda_activation_sync(output_mirror))
+        !dsv4_cuda_activation_sync(output_mirror)) {
+        /* M3d-1 (D7): on refusal the batch unit's grouped wo_a CPU loop reads
+         * the dropped wo_a RAM — reload once + permanent-CPU first. */
+        v4_vk_on_op_failure();
         return -1;
+    }
     return 0;
 }
 
@@ -11656,6 +11979,7 @@ int coli_v4_gpu_mhc_pre_norm(
     } else {
         v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){0};
         v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){0};
+        v4_vk_on_op_failure();   /* M3d-1 (D7) */
     }
     free(state_host);
     return good ? 0 : -1;
@@ -11701,6 +12025,7 @@ int coli_v4_gpu_mhc_post(const ColiDeepSeekV4LayerWeights *weights,
         dsv4_cuda_activation_download(outputs_hc, out, rh) &&
         dsv4_cuda_activation_sync(out);
     free(state_host);
+    if (!good) v4_vk_on_op_failure();   /* M3d-1 (D7) */
     return good ? 0 : -1;
 }
 #endif /* COLI_V4_GPU_TIER && _WIN32 */
@@ -16583,19 +16908,23 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
 
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
-    if (!output || !input || fp8_matvec_validate(weight))
-        return -1;
-    size_t columns = (size_t)weight->columns;
-    size_t scale_columns = columns / 128;
+    if (!output || !input) return -1;
 #ifdef COLI_V4_GPU_TIER
     /* The resident layer mirror carries a Dsv4CudaTensor* in view->gpu. Its
      * weight bytes are the UNPACKED row-major matrix (the resident copy may be
      * rows8-packed for the AVX2 CPU path), so the handle alone drives the call;
      * only the activation vectors cross the boundary. Any backend failure falls
-     * through to the CPU reference below. */
+     * through to the CPU reference below. Dispatch runs BEFORE the view
+     * validation: M3d-1/D7 frees the resident fp8 weight RAM after the VRAM
+     * upload, so weight->data may be NULL here — the handle is the source of
+     * truth until the one-time reload restores the RAM (the wrapper reloads on
+     * the first backend failure before this falls through). */
     if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
         return 0;
 #endif
+    if (fp8_matvec_validate(weight)) return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
     float *activation; uint8_t *activation_scales;
     if (coli_v4_qdq_scratch(columns, scale_columns, &activation, &activation_scales))
         return -1;
@@ -16616,12 +16945,13 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
  * path, which does its own thing exactly as in _ref. Bit-identical. */
 int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
                         const float *input, const float *activation) {
-    if (!output || !input || !activation || fp8_matvec_validate(weight))
-        return -1;
+    if (!output || !input || !activation) return -1;
 #ifdef COLI_V4_GPU_TIER
+    /* Dispatch before validation — see coli_fp8_matvec_ref (M3d-1/D7). */
     if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
         return 0;
 #endif
+    if (fp8_matvec_validate(weight)) return -1;
     return fp8_matvec_compute(output, weight, activation);
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT */
@@ -16828,19 +17158,22 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
 
 int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
-    if (!outputs || !inputs || fp8_batch_validate(weight, batch)) return -1;
-    size_t columns = (size_t)weight->columns;
-    size_t scale_columns = columns / 128;
+    if (!outputs || !inputs) return -1;
 #ifdef COLI_V4_GPU_TIER
     /* Same mirror-driven dispatch as coli_fp8_matvec_ref: the resident
      * layer's Dsv4CudaTensor handle rides on view->gpu and only activations
      * cross the boundary. Any backend refusal (no handle, stub matmul_batch
      * in an older DLL, allocation failure) falls through to the CPU
-     * reference below. */
+     * reference below. Dispatch before validation — M3d-1/D7 frees the
+     * resident fp8 weight RAM after the VRAM upload (weight->data may be
+     * NULL; the wrapper reloads on the first failure). */
     if (weight->gpu &&
         coli_v4_gpu_fp8_matmul_batch(weight, outputs, inputs, batch) == 0)
         return 0;
 #endif
+    if (fp8_batch_validate(weight, batch)) return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
     float *activations; uint8_t *activation_scales;
     if (coli_v4_qdq_scratch((size_t)batch * columns, (size_t)batch * scale_columns,
                             &activations, &activation_scales))
@@ -16864,13 +17197,14 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
 int coli_fp8_matmul_batch_pre(float *outputs, const ColiTensorView *weight,
                               const float *inputs, const float *activations,
                               int batch) {
-    if (!outputs || !inputs || !activations || fp8_batch_validate(weight, batch))
-        return -1;
+    if (!outputs || !inputs || !activations) return -1;
 #ifdef COLI_V4_GPU_TIER
+    /* Dispatch before validation — see coli_fp8_matmul_batch_ref (M3d-1/D7). */
     if (weight->gpu &&
         coli_v4_gpu_fp8_matmul_batch(weight, outputs, inputs, batch) == 0)
         return 0;
 #endif
+    if (fp8_batch_validate(weight, batch)) return -1;
     return fp8_batch_compute(outputs, weight, activations, batch);
 }
 
