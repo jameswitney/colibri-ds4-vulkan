@@ -380,6 +380,20 @@ test-vk-dsv4-mhc: shaders/qmatmul.spv tests/test_dsv4_mhc_vk.c $(VK_OPS_ORACLE_O
 	./tests/test_dsv4_mhc_vk
 endif
 
+# L2 fp4 expert tier parity (TEST.md §2 L2 / M5-1a): fp4 matvec (QDQ + fmt=7
+# mxfp4-e2m1 matmul) vs the REAL coli_fp4_matvec_ref, upload/refill, and the
+# routed-expert group vs the engine's per-expert forward chain (the same
+# NATIVE_QUANT + MATH oracle objects as the ops suite — coli_fp4_matvec_ref,
+# coli_bf16_round_array, coli_v4_swiglu). Also exercises COLI_DSV4_VK_OPS
+# gating and the COLI_DSV4_VK_FAIL=expert L4 hook at the backend level.
+.PHONY: test-vk-dsv4-experts
+ifeq ($(VK),1)
+test-vk-dsv4-experts: shaders/qmatmul.spv shaders/qdq.spv tests/test_dsv4_vk_experts.c $(VK_OPS_ORACLE_OBJS)
+	$(CC) -O2 -I. tests/test_dsv4_vk_experts.c backend_vulkan.c backend_vulkan_dsv4.c \
+		$(VK_OPS_ORACLE_OBJS) -o tests/test_dsv4_vk_experts -lvulkan -lm -fopenmp -pthread -Wl,--gc-sections
+	./tests/test_dsv4_vk_experts
+endif
+
 # L4 fault injection (TEST.md §4 / M3d gate): the COLI_DSV4_VK_FAIL hook
 # (backend_vulkan_dsv4.c) forces backend entries to fail so the D6 per-op
 # fallback is exercised deterministically — per-op isolation (fail=wo),

@@ -804,16 +804,35 @@ static int ds4vk_fp4_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
  * input slice x + g*group_width. */
 static int ds4vk_grouped_matvec(Dsv4CudaTensor *t, float *y, const float *x,
                                 int groups) {
-    /* M3e-3 (perf): the block-diagonal wo_a's per-group slices are read
-     * DIRECTLY from the arena via offset views and ALL groups run as ONE
-     * batched command buffer (1 QDQ over the packed rows + `groups` matmuls,
-     * one submit + one fence) — the per-group loop was 2 submits/group (16/
-     * layer for o_groups=8). The packed-row QDQ is per-row independent
-     * (qdq.comp workgroup per (block,row)), so the numerics are bitwise
-     * unchanged (L2 + L3 re-verified); the M3e-1 view keeps the same bytes
-     * and the same shader math. */
+    /* M3e-1 (perf): the block-diagonal wo_a's per-group slices are read
+     * DIRECTLY from the arena via offset views — no per-group tensor copies.
+     * The old copies re-read the host-visible VRAM arena over GTT (~50 MB/s)
+     * and cost ~600 ms/layer on first use (measured); the view keeps the same
+     * bytes and the same shader math, so the numerics are unchanged (L2 + L3
+     * re-verified). */
     if (!t || !t->vk || groups < 1 || t->O % groups || t->I % groups) return 0;
-    return coli_vk_matmul_grouped_batch(t->vk, y, x, groups, 8);
+    int Og = t->O / groups, Ig = t->I;
+    size_t n = (size_t)Ig;
+    float *act = malloc(n * sizeof(float));
+    uint8_t *actsc = malloc((n + 127) / 128);
+    if (!act || !actsc) { free(actsc); free(act); return 0; }
+    int ok = 1;
+    ColiVkTensor view = *t->vk;
+    ColiVkTensor *vp = &view;
+    view.fmt = 8;   /* wo_a may be fmt=9 (fp8-bf16 upload); the group slices
+                     * compute as fmt=8 (M3a: numerics unchanged, L3-verified) */
+    view.O = Og;    /* per-group output rows; rowWords stays the FULL row
+                     * stride (the shader reads at woff + o*rowWords) */
+    for (int g = 0; g < groups && ok; g++) {
+        view.woff = (int)((size_t)g * (size_t)Og * (size_t)view.rowWords);
+        view.soff = (int)((size_t)g * (size_t)((Og + 127) / 128) *
+                          (size_t)((Ig + 127) / 128));
+        ok = coli_vk_activation_qdq(act, actsc, x + (size_t)g * Ig, 1, Ig, 128) &&
+             coli_vk_matmul(&vp, y + (size_t)g * Og, act, NULL, NULL,
+                            8, 1, Ig, Og, 1);
+    }
+    free(actsc); free(act);
+    return ok;
 }
 
 /* f32 matvec (route gate logits; also the generic fmt-0 path). */
@@ -1872,21 +1891,17 @@ int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,
                            Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down, const float *weights,
                            int count, float limit, float *y, const float *x) {
-    /* M5-1b: decode-path routed-expert group, batched — TWO submits per layer
-     * per token instead of ~3 per expert (~19 for top-6). The engine's fused
-     * path calls this when ALL of a token's selected experts carry GPU
-     * mirrors. CPU reference: the per-expert coli_v4_expert_forward_ref
-     * accumulation the engine falls back to (gate/up fp4 matvecs -> bf16
-     * round -> swiglu(limit) -> *route_weight -> bf16 round -> down fp4
-     * matvec -> bf16 round -> sum). The VK tier replicates the CPU chain's
-     * rounding points BITWISE host-side (ds4vk_bf16 / ds4vk_sigmoid are the
-     * engine twins, proven by M3c); only the fp4 matvecs are GPU (thresholded,
-     * same contract as the fp8 tier). Phase 1 = QDQ(x) + ALL gate/up matmuls
-     * in ONE command buffer (they share one QDQ — the CPU QDQs per call,
-     * deterministic, so a single pass is bitwise identical); phase 2 =
-     * QDQ(hid rows, S=count) + ALL down matmuls in ONE command buffer. */
-    if (!y || !x || count < 1 || count > 64 || !gate || !up || !down ||
-        limit < 0.0f)
+    /* M5-1a: decode-path routed-expert group — the engine's fused path calls
+     * this when ALL of a token's selected experts carry GPU mirrors. CPU
+     * reference: the per-expert coli_v4_expert_forward_ref accumulation the
+     * engine falls back to (gate/up fp4 matvecs -> bf16 round -> swiglu(limit)
+     * -> *route_weight -> bf16 round -> down fp4 matvec -> bf16 round -> sum).
+     * The VK tier replicates the CPU chain's rounding points BITWISE host-side
+     * (ds4vk_bf16 / ds4vk_sigmoid are the engine twins, proven by M3c); only
+     * the fp4 matvecs are GPU (thresholded, same contract as the fp8 tier).
+     * The gate/up matvecs share ONE QDQ of x (the CPU QDQs per call —
+     * deterministic, so a single pass is bitwise identical). */
+    if (!y || !x || count < 1 || !gate || !up || !down || limit < 0.0f)
         return 0;
     /* op gate + L4 fault injection: the group has no single tensor handle,
      * gate the group pseudo-op directly (the mirrors carry it too). */
@@ -1908,52 +1923,49 @@ int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,
             return 0;
     struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
     double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
-    ColiVkTensor *gv[64], *uv[64], *dv[64];
-    for (int e = 0; e < count; e++) {
-        gv[e] = gate[e]->vk;
-        uv[e] = up[e]->vk;
-        dv[e] = down[e]->vk;
-    }
-    float *gatebuf = malloc((size_t)count * (size_t)I * sizeof(float));
-    float *upbuf = malloc((size_t)count * (size_t)I * sizeof(float));
-    float *hid = malloc((size_t)count * (size_t)I * sizeof(float));
-    float *out = malloc((size_t)count * (size_t)H * sizeof(float));
-    if (!gatebuf || !upbuf || !hid || !out) {
-        free(out); free(hid); free(upbuf); free(gatebuf);
+    float *act = malloc((size_t)H * sizeof(float));
+    uint8_t *actsc = malloc(((size_t)H + 127) / 128);
+    float *gatebuf = malloc((size_t)I * sizeof(float));
+    float *upbuf = malloc((size_t)I * sizeof(float));
+    float *hid = malloc((size_t)I * sizeof(float));
+    uint8_t *hidsc = malloc(((size_t)I + 127) / 128);
+    float *out = malloc((size_t)H * sizeof(float));
+    if (!act || !actsc || !gatebuf || !upbuf || !hid || !hidsc || !out) {
+        free(out); free(hidsc); free(hid); free(upbuf); free(gatebuf);
+        free(actsc); free(act);
         return 0;
     }
-    /* Phase 1: one submit for QDQ(x) + every expert's gate/up. */
-    int ok = coli_vk_expert_dsv4_phase1(gv, uv, gatebuf, upbuf, x,
-                                        count, H, I);
-    /* host rounding chain — bitwise vs coli_v4_expert_forward_ref:
-     * bf16(gate) / bf16(up) -> limit clamps -> sigmoid -> * weight -> bf16.
-     * The per-expert down QDQ uses a fresh activation (hid). */
-    if (ok)
-        for (int e = 0; e < count && ok; e++) {
-            const float *g = gatebuf + (size_t)e * I;
-            const float *u = upbuf + (size_t)e * I;
-            float *h = hid + (size_t)e * I;
-            for (int i = 0; i < I; i++) {
-                float gv_ = ds4vk_bf16(g[i]);
-                float uv_ = ds4vk_bf16(u[i]);
-                if (limit > 0.0f) {
-                    gv_ = fminf(gv_, limit);
-                    uv_ = fmaxf(-limit, fminf(uv_, limit));
-                }
-                h[i] = ds4vk_bf16(gv_ * ds4vk_sigmoid(gv_) * uv_ *
-                                   weights[e]);
+    memset(y, 0, (size_t)H * sizeof(float));
+    /* One QDQ of x feeds every expert's gate/up (the CPU QDQs per call —
+     * deterministic, so a single pass is bitwise identical). */
+    int ok = coli_vk_activation_qdq(act, actsc, x, 1, H, 128);
+    for (int e = 0; e < count && ok; e++) {
+        /* gate + up over the SHARED QDQ'd activation. */
+        ok = coli_vk_matmul(&gate[e]->vk, gatebuf, act, NULL, NULL,
+                            10, 1, H, I, 32) &&
+             coli_vk_matmul(&up[e]->vk, upbuf, act, NULL, NULL,
+                            10, 1, H, I, 32);
+        if (!ok) break;
+        /* host rounding chain — bitwise vs coli_v4_expert_forward_ref:
+         * bf16(gate) / bf16(up) -> limit clamps -> sigmoid -> * weight ->
+         * bf16. The per-expert down QDQ uses a fresh activation (hid). */
+        for (int i = 0; i < I; i++) {
+            float g = ds4vk_bf16(gatebuf[i]);
+            float u = ds4vk_bf16(upbuf[i]);
+            if (limit > 0.0f) {
+                g = fminf(g, limit);
+                u = fmaxf(-limit, fminf(u, limit));
             }
+            hid[i] = ds4vk_bf16(g * ds4vk_sigmoid(g) * u * weights[e]);
         }
-    /* Phase 2: one submit for QDQ(hid, S=count) + every expert's down. */
-    if (ok) ok = coli_vk_expert_dsv4_phase2(dv, out, hid, count, H, I);
-    if (ok) {
-        memset(y, 0, (size_t)H * sizeof(float));
-        for (int e = 0; e < count; e++) {
-            const float *o = out + (size_t)e * H;
-            for (int i = 0; i < H; i++) y[i] += ds4vk_bf16(o[i]);
-        }
+        ok = coli_vk_activation_qdq(hid, hidsc, hid, 1, I, 128) &&
+             coli_vk_matmul(&down[e]->vk, out, hid, NULL, NULL,
+                            10, 1, I, H, 32);
+        if (!ok) break;
+        for (int i = 0; i < H; i++) y[i] += ds4vk_bf16(out[i]);
     }
-    free(out); free(hid); free(upbuf); free(gatebuf);
+    free(out); free(hidsc); free(hid); free(upbuf); free(gatebuf);
+    free(actsc); free(act);
     if (ok) ds4vk_prof_tick(g0, t0);
     return ok;
 }

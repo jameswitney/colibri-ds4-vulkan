@@ -5253,7 +5253,19 @@ static int moe_token_pipeline(float *output,
                     float *y, const float *x);
                 if (!dsv4_cuda_expert_group(gates, ups, downs,
                     expert_weights, selected, config->swiglu_limit,
-                    expert_output, input)) result = -1;
+                    expert_output, input)) {
+                    /* D6: a wedged GPU degrades to the CPU per-expert chain
+                     * instead of failing the token (the upstream fused path
+                     * was token-fatal — a backend failure inside the group
+                     * should slow the run, never corrupt it). The CPU loop
+                     * is the same reference the non-GPU path runs. */
+                    for (int current = 0; !result &&
+                         current < selected; current++)
+                        result = coli_v4_expert_forward_ref(
+                            expert_output, &views[current], input,
+                            expert_weights[current],
+                            config->swiglu_limit);
+                }
                 if (!result)
                     for (int i = 0; i < d; i++)
                         expert_output[i] += shared_output[i];
@@ -8737,7 +8749,15 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
  * registered alternative ExpertStore backend receives a safe no-op rather
  * than having its opaque state reinterpreted here. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
-    if (!store || !store->state || store->gpu || !hot_find(store)) return;
+    if (!store || !store->state || !hot_find(store)) return;
+#if defined(COLI_V4_GPU_TIER) && !defined(COLI_V4_GPU_TIER_VK)
+    /* CUDA tier: the batched MoE path uploads its own expert bank, so the
+     * pool is unnecessary — and leaving it active would fight the CUDA
+     * mirror cache for slot ownership. The VK tier (M5-1a) has no batched
+     * bank: its prefill must keep the pool, or the 9 loader lanes exhaust
+     * the slots_per_layer=7 fallback (G11 hazard). */
+    if (store->gpu) return;
+#endif
     V4ExpertStoreState *state = store->state;
     if (layer < 0 || layer >= state->layers) layer = -1;
     pthread_mutex_lock(&state->mutex);
@@ -10105,13 +10125,20 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
      * fill up. ~8 MB per mirror measured. */
     mirror_suggested = 4096;
 #if defined(COLI_V4_GPU_TIER_VK)
-    /* VK v1 is dense-only (PLAN M5): fp4 expert mirrors are the later expert
-     * tier, so the mirror cache stays NULL here. That matters for more than
-     * memory: store->gpu non-NULL disables the hot store's prefill pool
-     * (coli_v4_expert_store_prefill_pool, an upstream guard for the CUDA
-     * tier), which confines prefill misses to slots_per_layer=7 per layer;
-     * the batched union's 9 loader lanes then exhaust them and the prefill
-     * fails. M5 re-enables this creation when the fp4 expert tier lands. */
+    /* VK expert tier (M5-1a): the fp4 routed-expert mirror cache is opt-in
+     * (COLI_DSV4_VK_EXPERTS=1). Off (default) keeps v1 behavior: store->gpu
+     * NULL keeps the hot store's prefill pool active (G11) and the decode
+     * pure-CPU on experts. On, the mirror cache attaches per-expert fp4
+     * mirrors (gate/up/down) and the decode routed-expert group runs on the
+     * GPU via dsv4_cuda_expert_group; the prefill pool stays active for the
+     * VK tier (see coli_v4_expert_store_prefill_pool), and the VRAM growth
+     * guard (v4_gpu_expert_attach_cached) bounds mirrors by free VRAM. */
+    if (engine->experts && !engine->experts->gpu) {
+        const char *vk_experts = getenv("COLI_DSV4_VK_EXPERTS");
+        if (vk_experts && atoi(vk_experts) != 0)
+            engine->experts->gpu =
+                v4_gpu_expert_mirrors_create(device, mirror_suggested);
+    }
 #else
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =

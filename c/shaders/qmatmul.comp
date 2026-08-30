@@ -196,6 +196,21 @@ void main() {
                 }
                 sum += a * scale[sb + uint(i0 / p.gs)];
             }
+        } else if (p.fmt == 10) { // dsv4 fp4 (M5-1a): e2m1 + per-ELEMENT group
+            // scale — replicates the engine rows16 kernel's (x*w)*scale order so
+            // extreme UE8M0 codes (0xfe -> 2^127 overflow, 0xff -> NaN) produce
+            // the CPU's per-element inf/NaN pattern (a per-group multiply would
+            // give a single ±inf/NaN instead of the sum of 32 independent
+            // overflows, diverging after the swiglu clamp repair). Additive:
+            // fmt 1/2/4/5/7/8 branches untouched (GLM paths byte-identical).
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(p.soff) + uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                float sc = scale[sb + uint(i0 / p.gs)];  /* 8-wide word never straddles a group */
+                for (int k = 0; k < 8; k++) { int i = i0 + k;
+                    if (i < p.I) sum += (staged ? xsh[i] : x[xoff + i]) * mx4(pk, k) * sc; }
+            }
         } else { // int4
             int words = (p.I + 7) / 8;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -207,6 +222,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8 || p.fmt == 0 || p.fmt == 16) ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8 || p.fmt == 10 || p.fmt == 0 || p.fmt == 16) ? tot : tot * scale[o];
     }
 }
