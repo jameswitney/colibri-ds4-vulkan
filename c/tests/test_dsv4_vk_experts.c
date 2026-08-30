@@ -42,6 +42,17 @@ extern int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
 extern void coli_bf16_round_array(float *values, size_t count);
 extern int coli_v4_swiglu(float *output, const float *gate, const float *up,
                           int dimension, float limit);
+extern float coli_bf16_round(float value);
+
+/* sigmoidf_stable twin (deepseek_v4.c) — the engine's swiglu sigmoid. */
+static float sigmoid_stable(float value) {
+    if (value >= 0.0f) {
+        float decay = expf(-value);
+        return 1.0f / (1.0f + decay);
+    }
+    float growth = expf(value);
+    return growth / (1.0f + growth);
+}
 
 /* UE8M0 -> f32 exactly as the CPU fp4 reference decodes it (the e8 TABLE:
  * 0xff -> NaN, else 2^(value-127) — deepseek_v4.c coli_e8m0_decode). The
@@ -320,6 +331,129 @@ static int run_expert_group(int hidden, int input, int experts, int topk,
     return bad;
 }
 
+/* ---- M5-1b: the two batched phase primitives, driven DIRECTLY (not via
+ * dsv4_cuda_expert_group) — pins the one-submit-per-phase entry points:
+ * phase1 = QDQ(x) + all gate/up matmuls, phase2 = QDQ(hid rows) + all down
+ * matmuls. The host rounding chain between phases is the same bitwise code
+ * the group runs; the final sum must match the CPU per-expert chain within
+ * the matvec threshold (tiny shape: bitwise). Also pins the refusal paths
+ * (count=0 / shape mismatch / bad fmt). */
+static int run_fused_phases(int hidden, int input, int experts, int topk,
+                            float limit, int verbose) {
+    /* The test's "hidden" = the gate/up matmul ROW count = moe intermediate
+     * (the phase API's I); "input" = the gate/up matmul COLUMN count = the
+     * activation dim (the phase API's H). The phase API convention matches
+     * dsv4_cuda_expert_group: H = activation, I = intermediate; gate/up are
+     * H->I, down is I->H. */
+    int H = input, I = hidden;
+    ColiVkTensor *g[8] = {0}, *u[8] = {0}, *d[8] = {0};
+    uint8_t *wg[8], *scg[8], *wu[8], *scu[8], *wd[8], *scd[8];
+    float *sg_[8], *su_[8], *sd_[8];   /* UE8M0 -> f32 expanded (like the backend upload) */
+    ColiTensorView vg[8], vu[8], vd[8];
+    float *x = malloc((size_t)H * 4);
+    float *yc = calloc((size_t)H, 4);
+    float *wgt = malloc((size_t)topk * 4);
+    for (int i = 0; i < H; i++) x[i] = (float)(rand() % 200001 - 100000) / 100.0f;
+    for (int e = 0; e < topk; e++) wgt[e] = (float)(rand() % 2000) / 1000.0f + 0.05f;
+    int bad = 0;
+    for (int e = 0; e < topk; e++) {
+        if (alloc_fp4(&wg[e], &scg[e], I, H) ||
+            alloc_fp4(&wu[e], &scu[e], I, H) ||
+            alloc_fp4(&wd[e], &scd[e], H, I)) { bad = 1; break; }
+        fill_fp4_view(&vg[e], wg[e], scg[e], I, H);
+        fill_fp4_view(&vu[e], wu[e], scu[e], I, H);
+        fill_fp4_view(&vd[e], wd[e], scd[e], H, I);
+        float *out = malloc((size_t)H * 4);
+        if (ref_expert_forward(out, &vg[e], &vu[e], &vd[e], x, wgt[e], limit)) {
+            free(out); bad = 1; break;
+        }
+        for (int i = 0; i < H; i++) yc[i] += out[i];
+        free(out);
+        size_t ng = (size_t)I * (size_t)(H / 32);   /* gate/up scales [O=I, H/32] */
+        size_t nd = (size_t)H * (size_t)(I / 32);   /* down scales [O=H, I/32] */
+        sg_[e] = malloc(ng * 4); su_[e] = malloc(ng * 4); sd_[e] = malloc(nd * 4);
+        if (!sg_[e] || !su_[e] || !sd_[e]) { bad = 1; break; }
+        for (size_t i = 0; i < ng; i++) {
+            sg_[e][i] = ref_ue8m0(scg[e][i]);
+            su_[e][i] = ref_ue8m0(scu[e][i]);
+        }
+        for (size_t i = 0; i < nd; i++) sd_[e][i] = ref_ue8m0(scd[e][i]);
+        if (!coli_vk_tensor_ensure(&g[e], wg[e], sg_[e], 10, H, I, 32) ||
+            !coli_vk_tensor_ensure(&u[e], wu[e], su_[e], 10, H, I, 32) ||
+            !coli_vk_tensor_ensure(&d[e], wd[e], sd_[e], 10, I, H, 32)) {
+            bad = 1; break;
+        }
+    }
+    if (!bad) {
+        float *gatebuf = malloc((size_t)topk * (size_t)I * 4);
+        float *upbuf = malloc((size_t)topk * (size_t)I * 4);
+        float *hid = malloc((size_t)topk * (size_t)I * 4);
+        float *out = malloc((size_t)topk * (size_t)H * 4);
+        float *yg = calloc((size_t)H, 4);
+        if (!gatebuf || !upbuf || !hid || !out || !yg) bad = 1;
+        else {
+            int ok = coli_vk_expert_dsv4_phase1(g, u, gatebuf, upbuf, x,
+                                                topk, H, I);
+            if (ok)
+                for (int e = 0; e < topk && ok; e++)
+                    for (int i = 0; i < I; i++) {
+                        float gv_ = coli_bf16_round(gatebuf[e * I + i]);
+                        float uv_ = coli_bf16_round(upbuf[e * I + i]);
+                        if (limit > 0.0f) {
+                            gv_ = fminf(gv_, limit);
+                            uv_ = fmaxf(-limit, fminf(uv_, limit));
+                        }
+                        hid[e * I + i] = coli_bf16_round(
+                            gv_ * sigmoid_stable(gv_) * uv_ * wgt[e]);
+                    }
+            if (ok) ok = coli_vk_expert_dsv4_phase2(d, out, hid, topk, H, I);
+            if (ok)
+                for (int e = 0; e < topk; e++)
+                    for (int i = 0; i < H; i++)
+                        yg[i] += coli_bf16_round(out[e * H + i]);
+            if (!ok) {
+                fprintf(stderr, "vk-experts: fused phases failed "
+                                "(hidden=%d input=%d topk=%d)\n",
+                        hidden, input, topk);
+                bad = 1;
+            } else {
+                if (verbose)
+                    printf("vk-experts fused phases (hidden=%d input=%d "
+                           "topk=%d limit=%.1f): ", hidden, input, topk, limit);
+                bad |= check_stats("fused", H, yg, yc, verbose);
+            }
+            /* refusal paths: count=0, a wrong fmt. */
+            if (coli_vk_expert_dsv4_phase1(g, u, gatebuf, upbuf, x, 0, H, I)) {
+                fprintf(stderr, "vk-experts: phase1 accepted count=0\n");
+                bad = 1;
+            }
+            if (coli_vk_expert_dsv4_phase2(d, out, hid, 0, H, I)) {
+                fprintf(stderr, "vk-experts: phase2 accepted count=0\n");
+                bad = 1;
+            }
+            ColiVkTensor bogus = *g[0];
+            bogus.fmt = 7;   /* not fp4-elem */
+            ColiVkTensor *bogus_arr[1] = {&bogus};
+            if (coli_vk_expert_dsv4_phase1(bogus_arr, u, gatebuf, upbuf, x,
+                                           1, H, I)) {
+                fprintf(stderr, "vk-experts: phase1 accepted fmt!=10\n");
+                bad = 1;
+            }
+            free(yg); free(out); free(hid); free(upbuf); free(gatebuf);
+        }
+    }
+    for (int e = 0; e < topk; e++) {
+        coli_vk_tensor_free(g[e]);
+        coli_vk_tensor_free(u[e]);
+        coli_vk_tensor_free(d[e]);
+        free(sd_[e]); free(wd[e]); free(scd[e]);
+        free(su_[e]); free(wu[e]); free(scu[e]);
+        free(sg_[e]); free(wg[e]); free(scg[e]);
+    }
+    free(wgt); free(yc); free(x);
+    return bad;
+}
+
 /* Env-sensitive scenarios (op gating, fault injection) must run in forked
  * children: the backend's COLI_DSV4_VK_OPS / COLI_DSV4_VK_FAIL masks are
  * process-static caches parsed at first use, so an env change mid-process
@@ -427,9 +561,11 @@ int main(void) {
     bad |= run_fp4_matvec(4096, 2048, 1);
     bad |= run_fp4_matvec_edge(2048, 4096, 1);
     bad |= run_expert_group(2048, 4096, 6, 6, 15.0f, 1);
+    bad |= run_fused_phases(2048, 4096, 6, 6, 15.0f, 1);
     /* tiny fixture shapes (4 experts, top-2, intermediate 128) */
     bad |= run_fp4_matvec(128, 128, 1);
     bad |= run_expert_group(128, 128, 4, 2, 15.0f, 1);
+    bad |= run_fused_phases(128, 128, 4, 2, 15.0f, 1);
 
     if (bad) { fprintf(stderr, "vk-experts: FAIL\n"); coli_vk_shutdown(); return 1; }
     printf("vk-experts: OK\n");

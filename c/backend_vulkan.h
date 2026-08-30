@@ -126,17 +126,6 @@ int  coli_vk_expert_dsv4_phase1(ColiVkTensor *const *gates, ColiVkTensor *const 
 int  coli_vk_expert_dsv4_phase2(ColiVkTensor *const *downs, float *down_out,
                                 const float *hid, int count, int H, int I);
 
-/* dsv4 grouped matvec, batched (M3e-3): the block-diagonal wo_a decode path
- * runs `groups` independent (QDQ + fmt=8 matmul) pairs. One QDQ over the
- * packed input rows (S=groups, per-row independent — bitwise same as the
- * per-group QDQs) + all `groups` matmuls (offset woff/soff views into the
- * one arena tensor) in ONE command buffer, one submit + one fence (16
- * submits/layer -> 1 for o_groups=8). x = groups*Ig floats (packed rows),
- * y = groups*Og floats. fmt=8 only (wo_a; fmt=9 uploads compute as 8).
- * Returns 0 on any failure — the caller falls back to the CPU chain (D6). */
-int  coli_vk_matmul_grouped_batch(ColiVkTensor *t, float *y, const float *x,
-                                  int groups, int fmt);
-
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
 int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);

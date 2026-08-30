@@ -5226,6 +5226,10 @@ static int moe_token_pipeline(float *output,
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
         void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
         int moe_ok = sg && su && sd;
+        /* M5-1b: when the fused group fails and the D6 CPU fallback runs, the
+         * routed sum accumulates in output (forward_ref overwrites its own
+         * buffer), so the tail must round output instead of expert_output. */
+        int routed_sum_in_output = 0;
         void **gates = malloc((size_t)selected * sizeof(*gates));
         void **ups = malloc((size_t)selected * sizeof(*ups));
         void **downs = malloc((size_t)selected * sizeof(*downs));
@@ -5258,21 +5262,36 @@ static int moe_token_pipeline(float *output,
                      * instead of failing the token (the upstream fused path
                      * was token-fatal — a backend failure inside the group
                      * should slow the run, never corrupt it). The CPU loop
-                     * is the same reference the non-GPU path runs. */
+                     * is the same reference the non-GPU path runs. NOTE:
+                     * coli_v4_expert_forward_ref OVERWRITES its output
+                     * buffer, so each expert's contribution must be
+                     * accumulated into output (zeroed above) — a fallback
+                     * that kept only the last expert would silently drop
+                     * the routed sum (M5-1b review fix). */
+                    routed_sum_in_output = 1;
                     for (int current = 0; !result &&
-                         current < selected; current++)
+                         current < selected; current++) {
                         result = coli_v4_expert_forward_ref(
                             expert_output, &views[current], input,
                             expert_weights[current],
                             config->swiglu_limit);
+                        if (!result)
+                            for (int i = 0; i < d; i++)
+                                output[i] += expert_output[i];
+                    }
                 }
-                if (!result)
+                if (!result && !routed_sum_in_output)
                     for (int i = 0; i < d; i++)
                         expert_output[i] += shared_output[i];
+                else if (!result)
+                    for (int i = 0; i < d; i++)
+                        output[i] += shared_output[i];
             }
             if (!result)
                 for (int i = 0; i < d; i++)
-                    output[i] = coli_bf16_round(expert_output[i]);
+                    output[i] = routed_sum_in_output
+                        ? coli_bf16_round(output[i])
+                        : coli_bf16_round(expert_output[i]);
         }
         free(gates); free(ups); free(downs);
     } else if (!result && hybrid_gpu_count > 0 && store->gpu) {
