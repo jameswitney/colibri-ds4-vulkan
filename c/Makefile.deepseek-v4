@@ -194,6 +194,41 @@ LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOM
 endif
 endif
 
+# ---- Linux/macOS Vulkan tier (opt-in): VK=1 ---------------------------------
+# Mirrors the parent Makefile's VK block: -DCOLI_VULKAN, -lvulkan, the Vulkan
+# backend object, and the four SPIR-V shaders. The .spv files are committed (D9)
+# so hosts/containers without glslc still build; the shaders/%.spv rule below
+# regenerates one only when its .comp is newer (M2-1 shader work). VK=1 and CUDA=1
+# are mutually exclusive: never a silent VK-wins build that orphans the CUDA tier.
+# VK=0 adds no flags, no link, no objects — the build stays byte-identical to
+# upstream (TEST L0 build parity).
+#
+# M1-3: the VK build now also defines COLI_V4_GPU_TIER (the engine GPU seam) and
+# COLI_V4_GPU_TIER_VK (backend selection) and links backend_vulkan_dsv4.o — the
+# dsv4 op surface implementing the same-named dsv4_cuda_* ABI (stub in M1-3, real
+# ops M2-M3; mechanism decision in backend_vulkan_dsv4.h). CUDA=1 alone keeps its
+# own flags and stays byte-identical to upstream.
+VK        ?= 0
+VK_OBJ     =
+VK_SPV     =
+GLSLC     ?= glslc
+ifeq ($(VK),1)
+ifeq ($(CUDA),1)
+$(error VK=1 and CUDA=1 are mutually exclusive: choose one GPU tier (CUDA=1 alone stays byte-identical to upstream; VK=1 is the Vulkan/RDNA2 tier))
+endif
+ifeq ($(IS_WIN),1)
+# D9 Windows note: COLI_V4_GPU_TIER is unconditional in the IS_WIN block, so a VK
+# build there would silently carry both tiers' plumbing. VK-on-Windows gating is
+# its own decision — refuse loudly until that decision exists.
+$(error VK=1 on Windows is not wired yet (PLAN D9: COLI_V4_GPU_TIER is unconditional in the IS_WIN block); Linux/macOS only in v1)
+endif
+CFLAGS   += -DCOLI_VULKAN -DCOLI_V4_GPU_TIER -DCOLI_V4_GPU_TIER_VK
+LDFLAGS  += -lvulkan
+VK_OBJ    = backend_vulkan.o backend_vulkan_dsv4.o
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
+V4_WIN_EXTRA_OBJS += $(VK_OBJ)
+endif
+
 include Makefile.deepseek-v4.units
 
 TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
@@ -219,7 +254,7 @@ deepseek-v4-objs: $(V4_OBJS)
 print-v4-objs:
 	@echo $(V4_OBJS)
 
-$(V4_BINARY): $(V4_OBJS)
+$(V4_BINARY): $(V4_OBJS) $(VK_SPV)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
 # Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
@@ -260,6 +295,22 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
 	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+# Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
+# VK=0: VK_OBJ/VK_SPV are empty and these rules never fire, so the default build
+# is unchanged (TEST L0 build parity, D9). The .spv are committed; the rule only
+# regenerates one when its .comp is newer (needs glslc from shaderc).
+backend_vulkan.o: backend_vulkan.c backend_vulkan.h
+	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+
+# dsv4 Vulkan op surface (M1-3 seam): same-named dsv4_cuda_* ABI over the
+# ds4vk_* implementation landing in M2-M3. Plain C, no ICD dependency — the
+# stub compiles and links on any box (TEST L0 seam completeness).
+backend_vulkan_dsv4.o: backend_vulkan_dsv4.c backend_vulkan_dsv4.h backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) -c backend_vulkan_dsv4.c -o $@
+shaders/%.spv: shaders/%.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (only needed to regenerate committed .spv; the committed copies build fine without it)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
 $(DEEPGEMM_STAMP):

@@ -34,6 +34,7 @@ c/iobench
 c/iobench.exe
 c/tok_test
 c/backend_cuda.o
+c/backend_vulkan.o
 c/backend_cuda_test
 c/backend_loader.o
 c/coli_cuda.dll

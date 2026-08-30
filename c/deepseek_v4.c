@@ -2144,8 +2144,12 @@ static int attention_token_impl(float *output,
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
+        /* D6 per-op fallback: the backend grouped matvec may refuse (VK stub
+         * until M2-M3, CUDA on a wedged GPU); only a SUCCESS takes the GPU
+         * path, anything else falls through to the CPU group loop below. */
+        if (wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0) {
+            /* GPU grouped matvec done */
         } else
 #endif
         for (int group = 0; group < groups; group++) {
@@ -2551,8 +2555,12 @@ static int attention_token_impl(float *output,
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
+        /* D6 per-op fallback: the backend grouped matvec may refuse (VK stub
+         * until M2-M3, CUDA on a wedged GPU); only a SUCCESS takes the GPU
+         * path, anything else falls through to the CPU group loop below. */
+        if (wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0) {
+            /* GPU grouped matvec done */
         } else
 #endif
         for (int group = 0; group < groups; group++) {
@@ -7033,8 +7041,12 @@ static int attention_token_impl(float *output,
     int scale_rows_per_group = (o_rank + 127) / 128;
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
+        /* D6 per-op fallback: the backend grouped matvec may refuse (VK stub
+         * until M2-M3, CUDA on a wedged GPU); only a SUCCESS takes the GPU
+         * path, anything else falls through to the CPU group loop below. */
+        if (wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0) {
+            /* GPU grouped matvec done */
         } else
 #endif
         for (int group = 0; group < groups; group++) {
@@ -9496,6 +9508,9 @@ int coli_v4_engine_open(ColiV4Engine **output,
 #ifdef COLI_V4_GPU_TIER
     coli_v4_gpu_engine_open(engine);
 #endif
+#ifdef COLI_VULKAN
+    coli_v4_vk_tier_probe();
+#endif
     *output = engine;
     return 0;
 
@@ -9506,6 +9521,87 @@ fail:
 #endif /* COLI_V4_UNIT_RUNTIME */
 
 #ifdef COLI_V4_UNIT_GPU
+#if defined(COLI_VULKAN)
+/* ######## deepseek_v4_gpu_vk.c ######## (M1-2)
+ *
+ * Standalone Vulkan tier probe for the VK=1 build (COLI_VULKAN). The GLM Vulkan
+ * backend (backend_vulkan.o) initializes at engine open so a VK build is never
+ * a silent no-op (upstream #894 class): it reports the tier state on stderr and
+ * continues CPU. The dsv4 op surface (fmt=8 matmul, attention, ...) lands in
+ * M2-M3; until then the tier is reported unavailable. COLI_DSV4_VK_DENSE=1 is
+ * the opt-in (D8) that will gate ops once they exist; the report itself is
+ * unconditional in the VK build so requested-but-unavailable is loud.
+ */
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "backend_vulkan.h"
+
+/* Mirror colibri.c's vk_resolve_spv: COLI_VK_SHADERS may be the qmatmul.spv
+ * file itself or a directory containing it; unset, look alongside the binary
+ * (<exedir>/shaders/, the build layout) before the CWD-relative fallback, so
+ * launching from outside c/ works. The other shaders load as siblings of the
+ * returned path (backend derive_*). */
+static const char *v4_vk_resolve_spv(char *buf, size_t n) {
+    const char *env = getenv("COLI_VK_SHADERS");
+    struct stat st;
+    if (env && *env) {
+        if (!stat(env, &st) && S_ISDIR(st.st_mode)) {
+            snprintf(buf, n, "%s/qmatmul.spv", env);
+            return buf;
+        }
+        return env;
+    }
+#ifdef __linux__
+    ssize_t k = readlink("/proc/self/exe", buf, n - 1);
+    if (k > 0) {
+        buf[k] = 0;
+        char *sl = strrchr(buf, '/');
+        if (sl && (size_t)(sl + 1 - buf) + sizeof("shaders/qmatmul.spv") <= n) {
+            strcpy(sl + 1, "shaders/qmatmul.spv");
+            if (!stat(buf, &st)) return buf;
+        }
+    }
+#endif
+    return "shaders/qmatmul.spv";
+}
+
+void coli_v4_vk_tier_probe(void) {
+    /* Effective opt-in state (D8): COLI_DSV4_VK_DENSE=1, or the engine-wide
+     * COLI_VULKAN=1 as a request signal. Mirrors v4_gpu_wanted() so the
+     * report is never out of step with the tier decision. */
+    const char *vk = getenv("COLI_DSV4_VK_DENSE");
+    const char *vulkan = getenv("COLI_VULKAN");
+    int wanted = (vk && atoi(vk) != 0) || (vulkan && atoi(vulkan) != 0);
+    if (!wanted) {
+        fprintf(stderr,
+                "v4_gpu vk tier=off (opt-in COLI_DSV4_VK_DENSE=1 unset); "
+                "continuing-CPU\n");
+        return;
+    }
+    /* Wanted: verify the GLM backend (libvulkan + committed shaders) resolves.
+     * The dsv4 seam itself is ICD-independent (M1-3 stub) and reports its own
+     * state from coli_v4_gpu_engine_open; this probe catches the requested-
+     * but-unavailable class (upstream #894). */
+    char spv[1024];
+    const char *path = v4_vk_resolve_spv(spv, sizeof(spv));
+    if (!coli_vk_init(path)) {
+        fprintf(stderr,
+                "v4_gpu warning=vk-backend-unavailable (%s); continuing-CPU "
+                "(need libvulkan + the committed shaders; set COLI_VK_SHADERS "
+                "or build with `make -C c deepseek-v4 VK=1`)\n",
+                path);
+        return;
+    }
+    coli_vk_shutdown();
+    fprintf(stderr,
+            "v4_gpu vk tier=seam (stub backend wired M1-3; real op surface "
+            "lands M2-M3); continuing-CPU\n");
+}
+#endif /* COLI_VULKAN */
+
 /* ######## deepseek_v4_gpu.c ########
  *
  * Optional CUDA tier for the dense projections. The kernels live in
@@ -9519,16 +9615,42 @@ fail:
  */
 #if defined(COLI_V4_GPU_TIER)
 #include "deepseek_v4_internal.h"
+/* GPU-backend seam (M1-3): the engine's coli_v4_gpu_* glue talks to the
+ * linked backend through the dsv4_cuda_* ABI. The CUDA tier is the upstream
+ * default; the VK build fills the same seam with backend_vulkan_dsv4.c
+ * (same-named ABI over the ds4vk_* implementation, D2/C2). The guarded
+ * include swap is the upstream-reviewable mechanism (PLAN D9):
+ * COLI_V4_GPU_TIER_VK selects the VK header, anything else keeps the CUDA
+ * one, so CUDA=1 builds compile exactly as upstream. Rebase-fail-fast is
+ * automatic: a new upstream dsv4_cuda_* call is declared (backend_vulkan_dsv4.h
+ * re-exports the ABI) but undefined until the VK backend implements it. */
+#if defined(COLI_V4_GPU_TIER_VK)
+#include "backend_vulkan_dsv4.h"
+#else
 #include "backend_cuda_dsv4.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
 static int v4_gpu_wanted(void) {
+#if defined(COLI_V4_GPU_TIER_VK)
+    /* VK tier is opt-in (D8): COLI_DSV4_VK_DENSE=1, or the engine-wide
+     * COLI_VULKAN=1 as a request signal. Unset = CPU — the opposite default
+     * of the CUDA tier (DSV4_CUDA defaults on when built). The probe reports
+     * the effective state at engine open, so a requested-but-unwired build is
+     * loud, never a silent no-op (upstream #894 class). */
+    const char *vk = getenv("COLI_DSV4_VK_DENSE");
+    if (vk && atoi(vk) != 0) return 1;
+    const char *vulkan = getenv("COLI_VULKAN");
+    if (vulkan && atoi(vulkan) != 0) return 1;
+    return 0;
+#else
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
     return 1;
+#endif
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
@@ -9577,10 +9699,26 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
      * that free VRAM sizes at run time; a generous default lets bigger cards
      * fill up. ~8 MB per mirror measured. */
     mirror_suggested = 4096;
+#if defined(COLI_V4_GPU_TIER_VK)
+    /* VK v1 is dense-only (PLAN M5): fp4 expert mirrors are the later expert
+     * tier, so the mirror cache stays NULL here. That matters for more than
+     * memory: store->gpu non-NULL disables the hot store's prefill pool
+     * (coli_v4_expert_store_prefill_pool, an upstream guard for the CUDA
+     * tier), which confines prefill misses to slots_per_layer=7 per layer;
+     * the batched union's 9 loader lanes then exhaust them and the prefill
+     * fails. M5 re-enables this creation when the fp4 expert tier lands. */
+#else
     if (engine->experts && !engine->experts->gpu)
         engine->experts->gpu =
             v4_gpu_expert_mirrors_create(device, mirror_suggested);
+#endif
+#if defined(COLI_V4_GPU_TIER_VK)
+    fprintf(stderr, "v4_gpu vk tier=seam device=%d (stub backend M1-3; real op "
+                    "surface lands M2-M3; compute falls back to CPU per D6)\n",
+            device);
+#else
     fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+#endif
     return 0;
 }
 
@@ -9912,6 +10050,27 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     }
     engine->gpu.layer_ready[layer] = 1;
     engine->gpu.uploaded_bytes += bytes;
+#if defined(COLI_V4_GPU_TIER_VK)
+    /* REVIEW G7 dense-set inventory (M1-3 spike): the per-layer resident plan,
+     * each tensor classified hooked (GPU handle present -> candidate for the
+     * D7 RAM drop in M3d) vs unhooked (must stay resident — e.g. any tensor
+     * this upload list does not cover, which M3d must map to its CPU consumers
+     * before freeing anything). The stub uploads above produced the handles;
+     * the names come from the plan. */
+    for (size_t i = 0; i < weights->plan.tensor_count; i++) {
+        const ColiDeepSeekV4TensorSpec *spec = &weights->plan.tensors[i];
+        long long tb = weights->gpu[i]
+            ? dsv4_cuda_tensor_bytes((Dsv4CudaTensor *)weights->gpu[i]) : 0;
+        fprintf(stderr, "v4_gpu vk inventory layer=%d hooked=%d name=%s "
+                        "dtype=%d rank=%d shape=",
+                weights->plan.layer, weights->gpu[i] != NULL, spec->name,
+                (int)spec->dtype, spec->rank);
+        for (int a = 0; a < spec->rank; a++)
+            fprintf(stderr, "%s%lld", a ? "x" : "",
+                    (long long)spec->shape[a]);
+        fprintf(stderr, " packed_rows8=%d bytes=%lld\n", spec->packed_rows8, tb);
+    }
+#endif
     struct timespec _ts1; clock_gettime(CLOCK_MONOTONIC, &_ts1);
     double _dt = (_ts1.tv_sec - _ts0.tv_sec) + (_ts1.tv_nsec - _ts0.tv_nsec) / 1e9;
     double _wall = time(NULL);

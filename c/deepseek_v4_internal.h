@@ -885,6 +885,14 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine);
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view);
 #endif
 
+#ifdef COLI_VULKAN
+/* VK=1 build: standalone Vulkan tier probe at engine open (M1-2). Provided by
+ * the COLI_V4_UNIT_GPU translation unit; defined only when COLI_VULKAN (VK=1).
+ * Reports the tier state on stderr and continues CPU — a VK build is never a
+ * silent no-op (upstream #894 class). */
+void coli_v4_vk_tier_probe(void);
+#endif
+
 struct ColiV4Engine {
     ColiDeepSeekV4Config config;
     ColiDeepSeekV4RuntimeOptions runtime;
