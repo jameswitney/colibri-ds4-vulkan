@@ -61,6 +61,15 @@ typedef struct Dsv4CudaTensor {
     float *whost_cache;
 } Dsv4CudaTensor;
 
+/* Batch mHC constants (M4-1): the batch ABI carries no eps/iters — mirror the
+ * CUDA tier's hardcoded values = the DeepSeek-V4-Flash-0731 config the prefill
+ * path runs under (rms_norm_eps 1e-6, hc_eps 1e-6, hc_sinkhorn_iters 20,
+ * post_mult 2.0). The engine wrapper restricts the batch path to
+ * hc==4 && hidden==4096, so these are the only values that occur. */
+#define DS4VK_MHC_EPS 1e-6f
+#define DS4VK_MHC_POST_MULT 2.0f
+enum { DS4VK_MHC_BATCH_ITERS = 20 };
+
 /* ---- per-op gating (TEST §0.5) ----
  * COLI_DSV4_VK_OPS=qkv,wo,route,head,shared — comma list; unset/empty =
  * every hooked op runs on the GPU. A disabled op returns failure, so the
@@ -80,6 +89,7 @@ typedef enum {
     DS4VK_OP_SHARED,
     DS4VK_OP_ATTN,
     DS4VK_OP_MHC,
+    DS4VK_OP_COMP,
     DS4VK_OP_COUNT
 } Ds4vkOp;
 
@@ -92,6 +102,7 @@ static const char *ds4vk_op_name(Ds4vkOp op) {
     case DS4VK_OP_SHARED: return "shared";
     case DS4VK_OP_ATTN: return "attn";
     case DS4VK_OP_MHC: return "mhc";
+    case DS4VK_OP_COMP: return "comp";
     default: return "none";
     }
 }
@@ -579,13 +590,21 @@ void dsv4_cuda_activation_free(Dsv4CudaActivation *a) {
 int dsv4_cuda_activation_upload(Dsv4CudaActivation *a, const float *x,
                                 long long elements) {
     /* M3a: host-side mirror (the decode path crosses host pointers; the
-     * batched prefill ops will move the bytes to device scratch in M4). */
+     * batched prefill ops will move the bytes to device scratch in M4).
+     * Capacity semantics (M4-1 fix): a->elements is the mirror's CAPACITY
+     * (the engine's v4_gpu_mhc_mirror grows it monotonically); the data
+     * buffer is allocated to that capacity ONCE and never shrunk — a
+     * realloc to the uploaded count allowed a later larger call to write
+     * past the shrunken buffer (ASAN: heap-buffer-overflow in
+     * ds4vk_mhc_sinkhorn after a 106-token post shrank the state buffer
+     * that a 128-token pre then wrote into). */
     if (!a || !x || elements < 1) return 0;
     if (a->elements < elements) return 0;
-    float *copy = realloc(a->data, (size_t)elements * sizeof(*copy));
-    if (!copy) return 0;
-    memcpy(copy, x, (size_t)elements * sizeof(*copy));
-    a->data = copy;
+    if (!a->data) {
+        a->data = malloc((size_t)a->elements * sizeof(float));
+        if (!a->data) return 0;
+    }
+    memcpy(a->data, x, (size_t)elements * sizeof(*x));
     return 1;
 }
 
@@ -602,10 +621,11 @@ int dsv4_cuda_activation_copy(Dsv4CudaActivation *dst,
     if (!dst || !src || !src->data || elements < 1 || dst->elements < elements ||
         src->elements < elements)
         return 0;
-    float *copy = realloc(dst->data, (size_t)elements * sizeof(*copy));
-    if (!copy) return 0;
-    memcpy(copy, src->data, (size_t)elements * sizeof(*copy));
-    dst->data = copy;
+    if (!dst->data) {
+        dst->data = malloc((size_t)dst->elements * sizeof(float));
+        if (!dst->data) return 0;
+    }
+    memcpy(dst->data, src->data, (size_t)elements * sizeof(*dst->data));
     return 1;
 }
 
@@ -617,11 +637,12 @@ int dsv4_cuda_activation_copy_range(Dsv4CudaActivation *dst,
         src_offset < 0 || dst->elements < dst_offset + elements ||
         src->elements < src_offset + elements)
         return 0;
-    float *copy = realloc(dst->data, (size_t)(dst_offset + elements) * sizeof(*copy));
-    if (!copy) return 0;
-    dst->data = copy;
-    memcpy(copy + dst_offset, src->data + src_offset,
-           (size_t)elements * sizeof(*copy));
+    if (!dst->data) {
+        dst->data = malloc((size_t)dst->elements * sizeof(float));
+        if (!dst->data) return 0;
+    }
+    memcpy(dst->data + dst_offset, src->data + src_offset,
+           (size_t)elements * sizeof(*dst->data));
     return 1;
 }
 
@@ -827,8 +848,24 @@ int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t, const Dsv4CudaActivation *input,
 
 int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor *t, const float *x, int tokens,
                                 float *y) {
-    (void)t; (void)x; (void)tokens; (void)y;
-    return 0;
+    /* M4-1: the compressor / indexer-compressor wkv+wgate projections for the
+     * prefill batch path (coli_v4_gpu_compressor_project_batch): one fmt=16
+     * matmul over all tokens (bf16 weights decode in-shader — the same
+     * fmt=16 branch the decode head matvec uses, bitwise decode + thresholded
+     * fp32-tree accumulate). The engine tags these mirrors "comp" so the
+     * COLI_DSV4_VK_OPS A/B gate isolates them; a disabled op returns 0 and
+     * the engine's compressor_step runs its per-token CPU projection (D6). */
+    if (!t || !t->vk || !x || tokens < 1 || !y || !ds4vk_op_enabled(t)) return 0;
+    if (ds4vk_fault_hit(t)) {
+        ds4vk_fault_log(ds4vk_op_name((Ds4vkOp)t->op));
+        return 0;
+    }
+    if (t->fmt != 16) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    int ok = coli_vk_matmul(&t->vk, y, x, NULL, NULL, 16, tokens, t->I, t->O, 1);
+    if (ok) ds4vk_prof_tick(t, t0);
+    return ok;
 }
 
 int dsv4_cuda_qkv(Dsv4CudaTensor *q_a, Dsv4CudaTensor *q_norm,
@@ -1275,23 +1312,159 @@ int dsv4_cuda_mhc_pre_norm(const Dsv4CudaActivation *residual,
                                 sink_iters, norm_eps, state, input);
 }
 
+/* M4-1: shared body of dsv4_cuda_mhc_pre_norm_batch / dsv4_cuda_mhc_pre_batch
+ * — one fn matvec over ALL tokens (fmt=0, S=tokens), then the per-token
+ * host-side chain exactly like the single-token ds4vk_mhc_pre_common: RMS
+ * inverse (sequential mean-square over the token's M*H slice), scale/base +
+ * sinkhorn, pre*residual sum + bf16 round, and (norm != NULL) the branch-
+ * norm rmsnorm + bf16 round — bitwise vs the engine's per-token
+ * normalized_hc_pre. State layout matches the CUDA batch contract (header
+ * comment on dsv4_cuda_mhc_post_pre_norm_batch): post_mix[tokens][M] then
+ * comb_mix[tokens][M*M]; the pre array is NOT stored (the post call reads
+ * only post/comb) — the input computation uses a local copy. M is not in the
+ * ABI; it is derived from the fn output rows N = 2M + M^2 and re-verified
+ * against the residual/state element counts. */
+static int ds4vk_mhc_pre_batch_common(const Dsv4CudaActivation *residual,
+                                      Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
+                                      Dsv4CudaTensor *base, Dsv4CudaTensor *norm,
+                                      int tokens, int H, float rms_eps,
+                                      float pre_eps, float sink_eps,
+                                      float post_mult, int sink_iters,
+                                      float norm_eps,
+                                      Dsv4CudaActivation *state,
+                                      Dsv4CudaActivation *input) {
+    if (!residual || !residual->data || !fn || !scale || !base || !state ||
+        !input || tokens < 1 || H < 1 || !fn->vk || !ds4vk_op_enabled(fn))
+        return 0;
+    if (ds4vk_fault_hit(fn)) {
+        ds4vk_fault_log("mhc");
+        return 0;
+    }
+    if (fn->fmt != 0 || scale->fmt != 0 || base->fmt != 0 ||
+        (norm && norm->fmt != 0))
+        return 0;
+    int N = fn->O;
+    long long Mll = (long long)(sqrtf((float)(1 + N)) + 0.5f) - 1;
+    if (Mll < 1 || Mll > 16 || 2 * Mll + Mll * Mll != N) return 0;
+    int M = (int)Mll, MH = M * H;
+    long long sh = (long long)tokens * (M + M * M);
+    long long xh = (long long)tokens * H;
+    if (fn->I != MH || residual->elements < (long long)tokens * MH ||
+        state->elements < sh || input->elements < xh ||
+        scale->O * scale->I < 3 || base->O * base->I < N ||
+        (norm && norm->O * norm->I < H))
+        return 0;
+    if (!state->data) {
+        state->data = calloc((size_t)state->elements, sizeof(float));
+        if (!state->data) return 0;
+    }
+    if (!input->data) {
+        input->data = calloc((size_t)input->elements, sizeof(float));
+        if (!input->data) return 0;
+    }
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    /* mix_raw[t*N+n] = sum_i fn[n][i]*residual[t*MH+i] — one fmt=0 matmul
+     * over all tokens (fp32 tree/warp order, same contract as the decode
+     * fn matvec). */
+    float *mixes = malloc((size_t)tokens * N * sizeof(*mixes));
+    float *pre_all = malloc((size_t)tokens * M * sizeof(*pre_all));
+    if (!mixes || !pre_all) { free(pre_all); free(mixes); return 0; }
+    int ok = coli_vk_matmul(&fn->vk, mixes, residual->data, NULL, NULL, 0,
+                            tokens, MH, N, 1);
+    if (ok) {
+        const float *sc = scale->whost_cache
+                            ? scale->whost_cache
+                            : coli_vk_tensor_wptr(scale->vk);
+        const float *bs = base->whost_cache
+                            ? base->whost_cache
+                            : coli_vk_tensor_wptr(base->vk);
+        const float *w = norm
+            ? (norm->whost_cache ? norm->whost_cache
+                                 : coli_vk_tensor_wptr(norm->vk))
+            : NULL;
+        if (!sc || !bs || (norm && !w)) {
+            ok = 0;
+        } else {
+            for (int t = 0; ok && t < tokens; t++) {
+                const float *res = residual->data + (size_t)t * MH;
+                float mean_square = 0.0f;
+                for (int i = 0; i < MH; i++)
+                    mean_square += res[i] * res[i];
+                float inverse_rms = 1.0f / sqrtf(mean_square / MH + rms_eps);
+                float *mx = mixes + (size_t)t * N;
+                for (int n = 0; n < N; n++) mx[n] *= inverse_rms;
+                float *post = state->data + (size_t)t * M;
+                float *comb =
+                    state->data + (size_t)tokens * M + (size_t)t * M * M;
+                float *pre = pre_all + (size_t)t * M;
+                if (!ds4vk_mhc_sinkhorn(pre, post, comb, mx, sc, bs, M,
+                                        sink_iters, pre_eps, post_mult,
+                                        sink_eps))
+                    ok = 0;
+            }
+        }
+    }
+    if (ok) {
+        for (int t = 0; t < tokens; t++) {
+            const float *res = residual->data + (size_t)t * MH;
+            const float *pre = pre_all + (size_t)t * M;
+            float *red = input->data + (size_t)t * H;
+            for (int h = 0; h < H; h++) {
+                float v = 0.0f;
+                for (int i = 0; i < M; i++)
+                    v += pre[i] * res[(size_t)i * H + h];
+                red[h] = ds4vk_bf16(v);
+            }
+            if (norm) {
+                const float *w = norm->whost_cache
+                                   ? norm->whost_cache
+                                   : coli_vk_tensor_wptr(norm->vk);
+                if (!w) { ok = 0; break; }
+                float mean_square = 0.0f;
+                for (int h = 0; h < H; h++)
+                    mean_square += red[h] * red[h];
+                float inverse_rms = 1.0f / sqrtf(mean_square / H + norm_eps);
+                for (int h = 0; h < H; h++)
+                    red[h] = ds4vk_bf16(red[h] * inverse_rms * w[h]);
+            }
+        }
+    }
+    free(pre_all); free(mixes);
+    if (ok) ds4vk_prof_tick(fn, t0);
+    return ok;
+}
+
 int dsv4_cuda_mhc_pre_norm_batch(const Dsv4CudaActivation *residual,
                                  Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
                                  Dsv4CudaTensor *base, Dsv4CudaTensor *norm,
                                  int tokens, int H, Dsv4CudaActivation *state,
                                  Dsv4CudaActivation *input) {
-    (void)residual; (void)fn; (void)scale; (void)base; (void)norm; (void)tokens;
-    (void)H; (void)state; (void)input;
-    return 0;
+    /* M4-1: the batched normalized_hc_pre (prefill block phase hc1/hc2). The
+     * engine wrapper (coli_v4_gpu_mhc_pre_norm_batch) uploaded the whole
+     * chunk's residual (tokens*hc*hidden) and downloads posts/combs/normalized
+     * after the call; any refusal -> the per-token CPU loop (D6). The ABI
+     * carries no eps/iters — mirror the CUDA tier and the engine's config:
+     * rms_norm_eps=1e-6, hc_eps=1e-6, hc_sinkhorn_iters=20, post_mult=2.0
+     * (the batch path only runs on the real model: the engine wrapper
+     * requires hc==4 && hidden==4096). */
+    return ds4vk_mhc_pre_batch_common(
+        residual, fn, scale, base, norm, tokens, H, DS4VK_MHC_EPS,
+        DS4VK_MHC_EPS, DS4VK_MHC_EPS, DS4VK_MHC_POST_MULT,
+        DS4VK_MHC_BATCH_ITERS, DS4VK_MHC_EPS, state, input);
 }
 
 int dsv4_cuda_mhc_pre_batch(const Dsv4CudaActivation *residual,
                             Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
                             Dsv4CudaTensor *base, int tokens, int H,
                             Dsv4CudaActivation *state, Dsv4CudaActivation *input) {
-    (void)residual; (void)fn; (void)scale; (void)base; (void)tokens; (void)H;
-    (void)state; (void)input;
-    return 0;
+    /* plain batched pre: the raw bf16-rounded pre*residual input (no norm
+     * rmsnorm) — the CUDA mhc_input batch contract; ABI completeness in the
+     * VK build (the engine uses the _norm variant). Same constants. */
+    return ds4vk_mhc_pre_batch_common(
+        residual, fn, scale, base, NULL, tokens, H, DS4VK_MHC_EPS,
+        DS4VK_MHC_EPS, DS4VK_MHC_EPS, DS4VK_MHC_POST_MULT,
+        DS4VK_MHC_BATCH_ITERS, 0.0f, state, input);
 }
 
 int dsv4_cuda_mhc_post(const Dsv4CudaActivation *x,
@@ -1373,17 +1546,73 @@ int dsv4_cuda_mhc_post_pre_norm_batch(const Dsv4CudaActivation *x,
                                       Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
                                       Dsv4CudaTensor *base, Dsv4CudaTensor *norm,
                                       Dsv4CudaActivation *input) {
-    (void)x; (void)residual; (void)state; (void)tokens; (void)H; (void)out;
-    (void)fn; (void)scale; (void)base; (void)norm; (void)input;
-    return 0;
+    /* M4-1: the fused batch post -> next pre_norm (CUDA-tier composition; the
+     * engine's VK prefill path calls post_batch + pre_norm_batch separately,
+     * this entry is ABI completeness): hc_post from the state into out, then
+     * normalized_hc_pre over out (the post output is the next residual). */
+    if (!ds4vk_op_enabled_g_mhc()) return 0;
+    return dsv4_cuda_mhc_post_batch(x, residual, state, tokens, H, out) &&
+           ds4vk_mhc_pre_batch_common(
+               out, fn, scale, base, norm, tokens, H, DS4VK_MHC_EPS,
+               DS4VK_MHC_EPS, DS4VK_MHC_EPS, DS4VK_MHC_POST_MULT,
+               DS4VK_MHC_BATCH_ITERS, DS4VK_MHC_EPS, state, input);
 }
 
 int dsv4_cuda_mhc_post_batch(const Dsv4CudaActivation *x,
                              const Dsv4CudaActivation *residual,
                              const Dsv4CudaActivation *state, int tokens, int H,
                              Dsv4CudaActivation *out) {
-    (void)x; (void)residual; (void)state; (void)tokens; (void)H; (void)out;
-    return 0;
+    /* M4-1: the batched coli_v4_hc_post — out[t][j][h] =
+     * bf16(post[t][j]*x[t][h] + sum_i comb[t][i][j]*residual[t][i][h]) in the
+     * CPU's per-token order, bf16-rounded at the same point (the engine's
+     * extra coli_bf16_round_array after the call is a no-op on the already-
+     * rounded values). post/comb come from the state activation in the CUDA
+     * batch layout [post (tokens*M)][comb (tokens*M*M)]; M is derived from
+     * state->elements / tokens (M^2 + M - E/t = 0). Gated on the mhc group
+     * directly (the op has no weight handle — same pattern as the decode
+     * post). */
+    if (!x || !x->data || !residual || !residual->data || !state ||
+        !state->data || !out || tokens < 1 || H < 1 ||
+        !ds4vk_op_enabled_g_mhc())
+        return 0;
+    if (ds4vk_fault_hit_g(DS4VK_OP_MHC)) {
+        ds4vk_fault_log("mhc");
+        return 0;
+    }
+    long long Ept = state->elements / tokens;   /* M + M*M */
+    long long Mll = (long long)((sqrtf(1.0f + 4.0f * (float)Ept) - 1.0f) / 2.0f + 0.5f);
+    if (Mll < 1 || Mll > 16 || Mll + Mll * Mll != Ept) return 0;
+    int M = (int)Mll, MH = M * H;
+    if (x->elements < (long long)tokens * H ||
+        residual->elements < (long long)tokens * MH ||
+        out->elements < (long long)tokens * MH)
+        return 0;
+    if (!out->data) {
+        out->data = calloc((size_t)out->elements, sizeof(float));
+        if (!out->data) return 0;
+    }
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    const float *post_base = state->data;
+    const float *comb_base = state->data + (size_t)tokens * M;
+    for (int t = 0; t < tokens; t++) {
+        const float *br = x->data + (size_t)t * H;
+        const float *res = residual->data + (size_t)t * MH;
+        const float *post = post_base + (size_t)t * M;
+        const float *comb = comb_base + (size_t)t * M * M;
+        float *o = out->data + (size_t)t * MH;
+        for (int j = 0; j < M; j++) {
+            for (int h = 0; h < H; h++) {
+                float v = post[j] * br[h];
+                for (int i = 0; i < M; i++)
+                    v += comb[(size_t)i * M + j] * res[(size_t)i * H + h];
+                o[(size_t)j * H + h] = ds4vk_bf16(v);
+            }
+        }
+    }
+    Dsv4CudaTensor fake; memset(&fake, 0, sizeof(fake)); fake.op = DS4VK_OP_MHC;
+    ds4vk_prof_tick(&fake, t0);
+    return 1;
 }
 
 int dsv4_cuda_attention_first(const Dsv4CudaActivation *input,

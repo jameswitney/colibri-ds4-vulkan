@@ -1445,10 +1445,22 @@ int coli_v4_expert_store_open_planned(
      * tier goes permanent-CPU (no flip-flopping). CUDA tier: kept resident,
      * dense_bytes stays (coli_v4_gpu_tier_wanted returns 0 there). */
     if (coli_v4_gpu_tier_wanted()) {
-        fprintf(stderr, "ram_tiers vk-dense: D7 drop active — dense RAM budget "
-                        "(%.2f GiB) moves to the expert cache\n",
-                dense_bytes / (double)GIB);
-        dense_bytes = 0;
+        const char *drop = getenv("COLI_DSV4_VK_DROP");
+        int drop_active = !(drop && !strcmp(drop, "0"));
+        if (drop_active) {
+            fprintf(stderr, "ram_tiers vk-dense: D7 drop active — dense RAM budget "
+                            "(%.2f GiB) moves to the expert cache\n",
+                    dense_bytes / (double)GIB);
+            dense_bytes = 0;
+        } else {
+            /* M4-3 A/B (dense-RAM held vs cleared): COLI_DSV4_VK_DROP=0 keeps
+             * the resident dense fp8 RAM (bandwidth-relief isolation — the
+             * expert cache keeps its D7-free budget). The plan must keep
+             * dense_bytes here so the expert-cache targets stay honest. */
+            fprintf(stderr, "ram_tiers vk-dense: D7 drop disabled "
+                            "(COLI_DSV4_VK_DROP=0) — dense RAM stays resident "
+                            "(%.2f GiB)\n", dense_bytes / (double)GIB);
+        }
     }
 #endif
     uint64_t per_slot = plan.expert_cache_bytes /
@@ -9943,6 +9955,9 @@ void coli_v4_gpu_layer_post_upload(ColiV4Engine *engine, int layer,
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return;
     const char *ops = getenv("COLI_DSV4_VK_OPS");
     if (ops && *ops) return;   /* A/B isolation: keep RAM for CPU fallbacks */
+    const char *drop = getenv("COLI_DSV4_VK_DROP");
+    if (drop && !strcmp(drop, "0")) return;  /* M4-3 A/B: hold the dense RAM
+                                              * (bandwidth-relief isolation) */
     static const char *const tensors[] = {
         "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
         "ffn.shared_experts.w1", "ffn.shared_experts.w2",
@@ -10464,6 +10479,13 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                 void *handle = v4_gpu_upload_bf16_matrix(
                     weights, engine->gpu.device, comp_keys[k], comp_rows,
                     config->hidden_size, &bytes);
+#if defined(COLI_V4_GPU_TIER_VK)
+                /* M4-1: the compressor projection mirrors are a distinct op
+                 * group (COLI_DSV4_VK_OPS=comp) — dsv4_cuda_upload_bf16
+                 * defaults to the head group, which would wrongly couple the
+                 * prefill compressor projections to the head A/B gate. */
+                if (handle) ds4vk_tensor_set_op((Dsv4CudaTensor *)handle, "comp");
+#endif
                 if (handle && coli_v4_layer_gpu_set(weights, comp_keys[k],
                                                     handle))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)handle);
@@ -10477,6 +10499,9 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                 void *handle = v4_gpu_upload_bf16_matrix(
                     weights, engine->gpu.device, idx_keys[k], idx_rows,
                     config->hidden_size, &bytes);
+#if defined(COLI_V4_GPU_TIER_VK)
+                if (handle) ds4vk_tensor_set_op((Dsv4CudaTensor *)handle, "comp");
+#endif
                 if (handle && coli_v4_layer_gpu_set(weights, idx_keys[k],
                                                     handle))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)handle);
