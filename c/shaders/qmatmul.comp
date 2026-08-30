@@ -7,8 +7,9 @@
 // per-row multiply at the end does not apply), 8=fp8-e4m3 (dsv4 dense: raw e4m3
 // bytes, ONE f32 scale per 128x128 BLOCK — scale[] holds ceil(O/128)*ceil(I/128)
 // entries, indexing (o/128)*ceil(I/128)+i/128, and the per-row multiply does NOT
-// apply). Weights are a byte buffer exposed as uint32 words; bytes/nibbles/planes
-// are extracted manually.
+// apply), 0=f32 (dsv4 route gate / mHC weights — one f32 per word, no scale),
+// 16=bf16 (dsv4 output head — two bf16 per word, no scale). Weights are a byte
+// buffer exposed as uint32 words; bytes/nibbles/planes are extracted manually.
 //
 // fmt=8 E4M3FN decode: 256-entry LUT as IEEE-754 bit patterns (intBitsToFloat),
 // generated from the CPU reference decode (deepseek_v4.c coli_e4m3fn_decode,
@@ -92,6 +93,15 @@ float i8(uint word, int lane) {
 float i4(uint word, int lane) {
     return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
 }
+// fmt=0 f32: one float per uint word (dsv4 route gate / mHC weights).
+// fmt=16 bf16: two bf16 per uint word, top 16 bits of the f32 = the value
+// (dsv4 output head; the engine's CPU path decodes identically, so the
+// bf16 decode is bitwise — TEST L2 head contract).
+float f32w(uint word) { return intBitsToFloat(int(word)); }
+float bf16w(uint word, int lane) {
+    uint b = (word >> (uint(lane) * 16u)) & 0xffffu;
+    return uintBitsToFloat(b << 16u);
+}
 // fmt=7 MXFP4 (Kimi K3 experts): e2m1 nibble, bit3 = sign, LOW nibble = even
 // column (same packing order as i4). Scales arrive as f32 (host pre-expands
 // the ue8m0 exponents), one per 32-input group.
@@ -130,6 +140,26 @@ void main() {
             } else for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
                 for (int k = 0; k < 4; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i8(pk, k); }
+            }
+        } else if (p.fmt == 0) { // f32 (dsv4 route gate / mHC): one f32 per word
+            int words = p.rowWords;
+            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi;
+                if (i0 < p.I) sum += xsh[i0] * f32w(pk);
+            } else for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi;
+                if (i0 < p.I) sum += x[xoff + i0] * f32w(pk);
+            }
+        } else if (p.fmt == 16) { // bf16 (dsv4 output head): 2 bf16 per word, no scale
+            int words = p.rowWords;
+            if (staged) for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 2;
+                for (int k = 0; k < 2; k++) { int i = i0 + k;
+                    if (i < p.I) sum += xsh[i] * bf16w(pk, k); }
+            } else for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 2;
+                for (int k = 0; k < 2; k++) { int i = i0 + k;
+                    if (i < p.I) sum += x[xoff + i] * bf16w(pk, k); }
             }
         } else if (p.fmt == 5) { // int3-g64: lanes stride the 16-value LOW-PLANE words;
             // all 16 values of one low word share a group, so its scale multiplies the
@@ -199,6 +229,6 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8) ? tot : tot * scale[o];
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8 || p.fmt == 0 || p.fmt == 16) ? tot : tot * scale[o];
     }
 }

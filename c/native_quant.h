@@ -81,6 +81,9 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
                                const float *input, int groups);
 int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
                                  const float *inputs, int batch);
+/* M3a head: GPU bf16 head matvec + argmax (VK tier; CUDA returns non-zero so
+ * the CPU reference runs). Returns 0 on success. */
+int coli_v4_gpu_head_argmax(const float *hidden, int *id, float *value);
 #endif
 
 #ifdef __cplusplus

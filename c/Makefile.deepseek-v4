@@ -323,6 +323,32 @@ test-vk-dsv4: shaders/qmatmul.spv shaders/qdq.spv $(VK_DQDQ_ORACLE_OBJ)
 	./tests/test_vk_dsv4_fp8
 endif
 
+# L2 per-op parity (TEST.md §2 L2 / M3a): qkv chain + grouped wo + route + head
+# vs the engine's CPU functions. Oracle objects link the REAL engine units
+# (NATIVE_QUANT matvec/qdq/bf16-round, MATH rmsnorm, ROUTE_BF16 top-6) without
+# the GPU-tier defines — the pure-CPU reference paths are what link
+# (-ffunction-sections + gc-sections keeps only the referenced functions).
+.PHONY: test-vk-dsv4-ops
+ifeq ($(VK),1)
+VK_OPS_ORACLE_OBJS = tests/.vk_ops_oracle_nq.o tests/.vk_ops_oracle_math.o tests/.vk_ops_oracle_route.o
+tests/.vk_ops_oracle_nq.o: deepseek_v4.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections \
+		-UCOLI_V4_GPU_TIER -UCOLI_V4_GPU_TIER_VK -UCOLI_VULKAN \
+		-DCOLI_V4_UNIT_NATIVE_QUANT -c deepseek_v4.c -o $@
+tests/.vk_ops_oracle_math.o: deepseek_v4.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections \
+		-UCOLI_V4_GPU_TIER -UCOLI_V4_GPU_TIER_VK -UCOLI_VULKAN \
+		-DCOLI_V4_UNIT_MATH -c deepseek_v4.c -o $@
+tests/.vk_ops_oracle_route.o: deepseek_v4.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections \
+		-UCOLI_V4_GPU_TIER -UCOLI_V4_GPU_TIER_VK -UCOLI_VULKAN \
+		-DCOLI_V4_UNIT_ROUTE_BF16 -c deepseek_v4.c -o $@
+test-vk-dsv4-ops: shaders/qmatmul.spv shaders/qdq.spv $(VK_OPS_ORACLE_OBJS)
+	$(CC) -O2 -I. tests/test_dsv4_vk_ops.c backend_vulkan.c backend_vulkan_dsv4.c \
+		$(VK_OPS_ORACLE_OBJS) -o tests/test_dsv4_vk_ops -lvulkan -lm -fopenmp -pthread -Wl,--gc-sections
+	./tests/test_dsv4_vk_ops
+endif
+
 # dsv4 Vulkan op surface (M1-3 seam): same-named dsv4_cuda_* ABI over the
 # ds4vk_* implementation landing in M2-M3. Plain C, no ICD dependency — the
 # stub compiles and links on any box (TEST L0 seam completeness).

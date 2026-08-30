@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -40,14 +41,116 @@
 typedef struct Dsv4CudaTensor {
     int device;
     long long bytes;   /* uploaded weight bytes (real accounting) */
-    int fmt;           /* 8=fp8-e4m3, 9=fp8-bf16-rounded, 4=fp4, 16=bf16, 32=f32 */
+    int fmt;           /* 8=fp8-e4m3, 9=fp8-bf16-rounded, 4=fp4, 16=bf16, 32=f32, 0=f32-as-raw */
     int O, I;
     ColiVkTensor *vk;  /* the arena handle (M2-3: real uploads; M3a compute) */
+    /* M3a: per-op gating group (TEST §0.5 COLI_DSV4_VK_OPS). Set by
+     * ds4vk_tensor_set_op at upload (the engine knows the tensor name; the
+     * ABI does not carry one). */
+    int op;
+    /* M3a grouped matvec (wo_a): per-group sub-tensors sliced from the full
+     * block-diagonal upload on first grouped use (groups of o_rank x
+     * group_width stacked vertically — the resident layout, PLAN G7). */
+    int groups;
+    ColiVkTensor **gvk;
 } Dsv4CudaTensor;
+
+/* ---- per-op gating (TEST §0.5) ----
+ * COLI_DSV4_VK_OPS=qkv,wo,route,head,shared — comma list; unset/empty =
+ * every hooked op runs on the GPU. A disabled op returns failure, so the
+ * engine's per-op dispatch falls back to the CPU reference (D6) — this turns
+ * the whole of L3 into per-op A/B isolation (flip one group at a time and
+ * compare against the all-CPU run). The groups mirror the M3a op surface:
+ * qkv (wq_a/wq_b/wkv matvecs), wo (wo_a grouped + wo_b), route (ffn gate
+ * logits + top-6), head (head.weight bf16 matvec + argmax), shared
+ * (ffn.shared_experts.w1/w2/w3 fp8 matvecs). */
+typedef enum {
+    DS4VK_OP_NONE = 0,
+    DS4VK_OP_QKV,
+    DS4VK_OP_WO,
+    DS4VK_OP_ROUTE,
+    DS4VK_OP_HEAD,
+    DS4VK_OP_SHARED,
+    DS4VK_OP_COUNT
+} Ds4vkOp;
+
+static const char *ds4vk_op_name(Ds4vkOp op) {
+    switch (op) {
+    case DS4VK_OP_QKV: return "qkv";
+    case DS4VK_OP_WO: return "wo";
+    case DS4VK_OP_ROUTE: return "route";
+    case DS4VK_OP_HEAD: return "head";
+    case DS4VK_OP_SHARED: return "shared";
+    default: return "none";
+    }
+}
+
+static Ds4vkOp ds4vk_op_from_name(const char *name) {
+    if (!name || !*name) return DS4VK_OP_NONE;
+    for (int op = 1; op < DS4VK_OP_COUNT; op++)
+        if (strcmp(name, ds4vk_op_name((Ds4vkOp)op)) == 0) return (Ds4vkOp)op;
+    return DS4VK_OP_NONE;
+}
+
+/* Parsed once: bitmask of enabled op groups. -1 = env unset/empty (ALL hooked
+ * ops enabled — TEST §0.5); otherwise the bitmask (0 = none valid -> all CPU). */
+static int ds4vk_op_mask(void) {
+    static int mask = -2;
+    if (mask == -2) {
+        const char *env = getenv("COLI_DSV4_VK_OPS");
+        if (!env || !*env) {
+            mask = -1;
+        } else {
+            mask = 0;
+            char *copy = strdup(env);
+            if (copy) {
+                for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
+                    while (*tok == ' ' || *tok == '\t') tok++;
+                    Ds4vkOp op = ds4vk_op_from_name(tok);
+                    if (op != DS4VK_OP_NONE) mask |= 1 << op;
+                }
+                free(copy);
+            }
+        }
+    }
+    return mask;
+}
+
+int ds4vk_tensor_set_op(Dsv4CudaTensor *t, const char *group) {
+    if (!t) return 0;
+    t->op = ds4vk_op_from_name(group);
+    return t->op != DS4VK_OP_NONE;
+}
+
+/* The op gate: enabled when COLI_DSV4_VK_OPS is unset/empty (default = all
+ * hooked) or the tensor's group is listed. A gated-off op returns 0 from the
+ * compute entry so the engine falls back to CPU (D6). */
+static int ds4vk_op_enabled(const Dsv4CudaTensor *t) {
+    if (!t) return 0;
+    int mask = ds4vk_op_mask();
+    if (mask < 0) return t->op != DS4VK_OP_NONE;
+    return t->op != DS4VK_OP_NONE && ((mask >> t->op) & 1);
+}
+
+/* ---- per-op wall timing (VK_PROF=1, the backend's own gate) ---- */
+static double g_op_ms[DS4VK_OP_COUNT];
+static long g_op_n[DS4VK_OP_COUNT];
+static void ds4vk_prof_tick(const Dsv4CudaTensor *t, double t0) {
+    const char *prof = getenv("VK_PROF");
+    if (!prof || atoi(prof) == 0) return;
+    int op = t && t->op > DS4VK_OP_NONE && t->op < DS4VK_OP_COUNT ? t->op : 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec / 1e9;
+    g_op_ms[op] += (now - t0) * 1000.0;
+    if ((++g_op_n[op] & 4095) == 0)
+        fprintf(stderr, "[VK_PROF dsv4] op=%s n=%ld total=%.0f ms\n",
+                ds4vk_op_name((Ds4vkOp)op), g_op_n[op], g_op_ms[op]);
+}
 
 typedef struct Dsv4CudaActivation {
     int device;
     long long elements;
+    float *data;       /* host copy (M3a: route reads it directly; batched ops M4) */
 } Dsv4CudaActivation;
 
 typedef struct Dsv4CudaKvCache {
@@ -64,6 +167,7 @@ typedef struct Dsv4CudaGraph {
 
 static const char *stub_fmt_name(int fmt) {
     switch (fmt) {
+    case 0:  return "f32";
     case 8:  return "fp8-e4m3";
     case 9:  return "fp8-bf16";
     case 4:  return "fp4";
@@ -195,7 +299,17 @@ int dsv4_cuda_init(const int *devices, int count) {
     return 1;
 }
 
-void dsv4_cuda_shutdown(void) { coli_vk_shutdown(); }
+void dsv4_cuda_shutdown(void) {
+    const char *prof = getenv("VK_PROF");
+    if (prof && atoi(prof) != 0) {
+        for (int op = 1; op < DS4VK_OP_COUNT; op++)
+            if (g_op_n[op])
+                fprintf(stderr, "[VK_PROF dsv4] op=%-6s n=%-6ld total=%.1f ms avg=%.3f ms\n",
+                        ds4vk_op_name((Ds4vkOp)op), g_op_n[op], g_op_ms[op],
+                        g_op_ms[op] / (double)g_op_n[op]);
+    }
+    coli_vk_shutdown();
+}
 
 int dsv4_cuda_backend_arch_ok(int device) { (void)device; return coli_vk_available(); }
 
@@ -267,24 +381,51 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
 
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t, const uint16_t *w, int O, int I,
                           int device) {
-    /* Deferred: bf16 mirrors (compressor / indexer-compressor projections)
-     * only upload under COLI_CUDA_ATTN_BATCH=1, whose batched ops are M4. */
-    (void)w; (void)O; (void)I; (void)device;
-    if (t) *t = NULL;
-    fprintf(stderr, "v4_gpu vk upload bf16 deferred (batched attention ops are "
-                    "M4); tensor stays CPU\n");
-    return 0;
+    /* M3a: real bf16 upload (fmt=16, unquantized — the head.weight matvec
+     * decodes bf16 in-shader; the compressor/indexer mirrors stay deferred
+     * (M4 batched path). The head consumes the raw resident bf16 bytes, so
+     * upload is byte-identical and the decode happens at matvec time. */
+    if (!t || !w) return 0;
+    ColiVkTensor *vk = NULL;
+    int ok = device == 0
+        ? coli_vk_tensor_ensure(&vk, w, NULL, 16, I, O, 0)
+        : coli_vk_dev2_available()
+            ? coli_vk_tensor_ensure2(&vk, w, NULL, 16, I, O, 0)
+            : 0;
+    if (!ok) { *t = NULL; return 0; }
+    Dsv4CudaTensor *h = calloc(1, sizeof(*h));
+    if (!h) { coli_vk_tensor_free(vk); *t = NULL; return 0; }
+    h->device = device; h->fmt = 16; h->O = O; h->I = I;
+    h->vk = vk; h->bytes = (long long)coli_vk_tensor_bytes(vk);
+    h->op = DS4VK_OP_HEAD;   /* only the output head uses bf16 in v1 */
+    *t = h;
+    stub_upload_log("bf16", device, O, I, 16, h->bytes);
+    return 1;
 }
 
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t, const float *w, int O, int I,
                          int device) {
-    /* Deferred: f32 mirrors (route gate, mHC fn/scale/base, head branch
-     * norms) belong to the M3a/M3c ops; the tensors stay CPU until then. */
-    (void)w; (void)O; (void)I; (void)device;
-    if (t) *t = NULL;
-    fprintf(stderr, "v4_gpu vk upload f32 deferred (route/mHC/head ops land "
-                    "M3a-M3c); tensor stays CPU\n");
-    return 0;
+    /* M3a: real f32 upload (fmt=0, one f32 per word in the matmul shader).
+     * Consumers in v1: the route gate (256 x hidden) + bias (O=256, I=1) and
+     * the mHC fn/scale/base mirrors (batched path, M4). The engine decodes
+     * the resident bf16 gate to f32 at upload (v4_gpu_upload_gate), so the
+     * bytes here are the exact f32 mirror — no conversion. */
+    if (!t || !w) return 0;
+    ColiVkTensor *vk = NULL;
+    int ok = device == 0
+        ? coli_vk_tensor_ensure(&vk, w, NULL, 0, I, O, 0)
+        : coli_vk_dev2_available()
+            ? coli_vk_tensor_ensure2(&vk, w, NULL, 0, I, O, 0)
+            : 0;
+    if (!ok) { *t = NULL; return 0; }
+    Dsv4CudaTensor *h = calloc(1, sizeof(*h));
+    if (!h) { coli_vk_tensor_free(vk); *t = NULL; return 0; }
+    h->device = device; h->fmt = 0; h->O = O; h->I = I;
+    h->vk = vk; h->bytes = (long long)coli_vk_tensor_bytes(vk);
+    h->op = DS4VK_OP_ROUTE;   /* route gate/bias are the only f32 uploads in v1 */
+    *t = h;
+    stub_upload_log("f32", device, O, I, 0, h->bytes);
+    return 1;
 }
 
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
@@ -297,6 +438,9 @@ int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
 
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) {
     if (!t) return;
+    for (int g = 0; t->gvk && g < t->groups; g++)
+        if (t->gvk[g]) coli_vk_tensor_free(t->gvk[g]);
+    free(t->gvk);
     if (t->vk) coli_vk_tensor_free(t->vk);
     free(t);
 }
@@ -317,38 +461,64 @@ Dsv4CudaActivation *dsv4_cuda_activation_create(int device, long long elements) 
     return a;
 }
 
-void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { free(a); }
+void dsv4_cuda_activation_free(Dsv4CudaActivation *a) {
+    if (!a) return;
+    free(a->data);
+    free(a);
+}
 
 int dsv4_cuda_activation_upload(Dsv4CudaActivation *a, const float *x,
                                 long long elements) {
-    (void)a; (void)x; (void)elements;
-    return 0;
+    /* M3a: host-side mirror (the decode path crosses host pointers; the
+     * batched prefill ops will move the bytes to device scratch in M4). */
+    if (!a || !x || elements < 1) return 0;
+    if (a->elements < elements) return 0;
+    float *copy = realloc(a->data, (size_t)elements * sizeof(*copy));
+    if (!copy) return 0;
+    memcpy(copy, x, (size_t)elements * sizeof(*copy));
+    a->data = copy;
+    return 1;
 }
 
 int dsv4_cuda_activation_download(float *x, const Dsv4CudaActivation *a,
                                   long long elements) {
-    (void)x; (void)a; (void)elements;
-    return 0;
+    if (!x || !a || !a->data || elements < 1 || a->elements < elements) return 0;
+    memcpy(x, a->data, (size_t)elements * sizeof(*x));
+    return 1;
 }
 
 int dsv4_cuda_activation_copy(Dsv4CudaActivation *dst,
                               const Dsv4CudaActivation *src,
                               long long elements) {
-    (void)dst; (void)src; (void)elements;
-    return 0;
+    if (!dst || !src || !src->data || elements < 1 || dst->elements < elements ||
+        src->elements < elements)
+        return 0;
+    float *copy = realloc(dst->data, (size_t)elements * sizeof(*copy));
+    if (!copy) return 0;
+    memcpy(copy, src->data, (size_t)elements * sizeof(*copy));
+    dst->data = copy;
+    return 1;
 }
 
 int dsv4_cuda_activation_copy_range(Dsv4CudaActivation *dst,
                                     long long dst_offset,
                                     const Dsv4CudaActivation *src,
                                     long long src_offset, long long elements) {
-    (void)dst; (void)dst_offset; (void)src; (void)src_offset; (void)elements;
-    return 0;
+    if (!dst || !src || !src->data || elements < 1 || dst_offset < 0 ||
+        src_offset < 0 || dst->elements < dst_offset + elements ||
+        src->elements < src_offset + elements)
+        return 0;
+    float *copy = realloc(dst->data, (size_t)(dst_offset + elements) * sizeof(*copy));
+    if (!copy) return 0;
+    dst->data = copy;
+    memcpy(copy + dst_offset, src->data + src_offset,
+           (size_t)elements * sizeof(*copy));
+    return 1;
 }
 
 int dsv4_cuda_activation_sync(const Dsv4CudaActivation *a) {
     (void)a;
-    return 0;
+    return 1;   /* host copy — nothing pending */
 }
 
 int dsv4_cuda_activation_device(const Dsv4CudaActivation *a) {
@@ -360,17 +530,160 @@ int dsv4_cuda_decode_state_set(int device, int token, int position) {
     return 0;
 }
 
-/* ---- compute ops: every one fails -> engine falls back to CPU (D6) ---- */
+/* ---- compute ops (M3a-1: decode-path matmul family) ----
+ * Each op reproduces the CPU chain the engine's per-op dispatch replaces
+ * (TEST L2): the fp8 matvecs run QDQ (block=128, the `_pre` hoist contract
+ * — bitwise vs coli_fp8_activation_qdq_ref, M2-2) then the fmt=8 matmul on
+ * the dequantized activation (thresholded vs the fp64-across-blocks CPU
+ * accumulate, M2-4); wo_a runs as `groups` independent matvecs over the
+ * block-diagonal resident layout; route runs the f32 gate logits matvec
+ * then the host-side top-6 (256 scores — exact same selection as the CPU
+ * route, including the strict-greater tie-break); head runs the bf16 matvec
+ * then a host argmax. Every entry returns 0 on ANY failure so the engine
+ * falls back to the CPU reference (D6) — a wedged GPU can slow a run,
+ * never corrupt it. */
+
+/* fp8 matvec: one QDQ pass (the _pre hoist contract) + one fmt=8 matmul on
+ * the dequantized activations — the exact GPU chain M2-4 pinned at global
+ * maxabs/maxref 1.4e-7..1.3e-6 vs the REAL coli_fp8_matvec_ref. */
+static int ds4vk_fp8_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
+    size_t n = (size_t)t->I;
+    float *act = malloc(n * sizeof(float));
+    uint8_t *actsc = malloc((n + 127) / 128);
+    if (!act || !actsc) { free(actsc); free(act); return 0; }
+    int ok = coli_vk_activation_qdq(act, actsc, x, 1, t->I, 128) &&
+             coli_vk_matmul(&t->vk, y, act, NULL, NULL, 8, 1, t->I, t->O, 1);
+    free(actsc); free(act);
+    return ok;
+}
+
+/* Grouped matvec (wo_a): the resident weight is the block-diagonal matrix
+ * stacked vertically — groups of o_rank rows x group_width columns. The full
+ * upload (O=groups*o_rank, I=group_width) is sliced into per-group tensors
+ * on first use (the group weight/scale rows are contiguous in the arena
+ * buffers); each group then runs the standard fmt=8 matvec against its own
+ * input slice x + g*group_width. */
+static int ds4vk_grouped_matvec_ensure(Dsv4CudaTensor *t, int groups) {
+    if (groups < 1 || t->O % groups || t->I % groups) return 0;
+    if (t->groups == groups && t->gvk) return 1;
+    for (int g = 0; t->gvk && g < t->groups; g++)
+        if (t->gvk[g]) coli_vk_tensor_free(t->gvk[g]);
+    free(t->gvk);
+    t->gvk = calloc((size_t)groups, sizeof(*t->gvk));
+    t->groups = groups;
+    if (!t->gvk || !t->vk) return 0;
+    int Og = t->O / groups, Ig = t->I;      /* per-group: o_rank x group_width */
+    const uint8_t *w = coli_vk_tensor_wptr(t->vk);
+    const float *s = coli_vk_tensor_sptr(t->vk);
+    if (!w || !s) return 0;                  /* backend down (no host-visible arena) */
+    size_t wrow = (size_t)((Ig + 3) / 4) * 4;   /* padded row stride, fmt=8 (I%4==0 -> I) */
+    size_t srow = (size_t)((Og + 127) / 128) * ((Ig + 127) / 128);
+    /* The arena holds the EXPANDED fp32 scales; upload_tensor fmt=8 wants raw
+     * E8M0 codes (it expands again). Re-encode the group's slice like the
+     * engine's v4_gpu_upload_fp8_fmt does (power-of-two scales: exponent+127,
+     * NaN -> 0xff). */
+    uint8_t *e8 = malloc(srow);
+    if (!e8) return 0;
+    for (int g = 0; g < groups; g++) {
+        const uint8_t *wg = w + (size_t)g * Og * wrow;
+        const float *sg = s + (size_t)g * srow;
+        for (size_t b = 0; b < srow; b++) {
+            float value = sg[b];
+            if (isnan(value) || !isfinite(value)) { e8[b] = 0xff; continue; }
+            e8[b] = (uint8_t)(ilogbf(value) + 127);
+        }
+        if (!coli_vk_tensor_ensure(&t->gvk[g], wg, (const float *)e8, 8, Ig, Og, 0)) {
+            free(e8);
+            return 0;
+        }
+    }
+    free(e8);
+    return 1;
+}
+
+static int ds4vk_grouped_matvec(Dsv4CudaTensor *t, float *y, const float *x,
+                                int groups) {
+    if (!ds4vk_grouped_matvec_ensure(t, groups)) return 0;
+    int Og = t->O / groups, Ig = t->I;
+    size_t n = (size_t)Ig;
+    float *act = malloc(n * sizeof(float));
+    uint8_t *actsc = malloc((n + 127) / 128);
+    if (!act || !actsc) { free(actsc); free(act); return 0; }
+    int ok = 1;
+    for (int g = 0; g < groups && ok; g++) {
+        ok = coli_vk_activation_qdq(act, actsc, x + (size_t)g * Ig, 1, Ig, 128) &&
+             coli_vk_matmul(&t->gvk[g], y + (size_t)g * Og, act, NULL, NULL,
+                            8, 1, Ig, Og, 1);
+    }
+    free(actsc); free(act);
+    return ok;
+}
+
+/* f32 matvec (route gate logits; also the generic fmt-0 path). */
+static int ds4vk_f32_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
+    return coli_vk_matmul(&t->vk, y, x, NULL, NULL, 0, 1, t->I, t->O, 1);
+}
+
+/* bf16 matvec (head.weight): fmt=16 in the same shader — in-shader bf16
+ * decode is bitwise (f32 bits = b<<16), accumulation thresholded. */
+static int ds4vk_bf16_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
+    return coli_vk_matmul(&t->vk, y, x, NULL, NULL, 16, 1, t->I, t->O, 1);
+}
+
+/* The CPU route's top-6 (coli_v4_route_bf16, deepseek_v4.c): scores =
+ * sqrt(softplus(logit)), selection = score + bias, pick the topk unselected
+ * with STRICTLY-greater replacement (smallest index wins ties — matches
+ * route_top6_serial's route_better), weights = score/total*scale. The GPU
+ * only computes the 256 logits; this host-side selection is bit-exact vs
+ * the CPU route given the same logits. */
+static int ds4vk_route_top6(int *ids, float *weights, const float *logits,
+                            const float *bias, const int *fixed, int topk,
+                            float scale) {
+    float scores[256], selection[256];
+    for (int e = 0; e < 256; e++) {
+        float l = logits[e];
+        scores[e] = sqrtf(fmaxf(l, 0.0f) + log1pf(expf(-fabsf(l))));
+        selection[e] = scores[e] + (bias ? bias[e] : 0.0f);
+    }
+    if (fixed) {
+        for (int k = 0; k < topk; k++) ids[k] = fixed[k];
+    } else {
+        int selected[256]; memset(selected, 0, sizeof(selected));
+        for (int k = 0; k < topk; k++) {
+            int best = -1;
+            for (int e = 0; e < 256; e++)
+                if (!selected[e] && (best < 0 || selection[e] > selection[best]))
+                    best = e;
+            ids[k] = best; selected[best] = 1;
+        }
+    }
+    float total = 0.0f;
+    for (int k = 0; k < topk; k++) total += scores[ids[k]];
+    if (!(total > 0.0f)) return 0;
+    for (int k = 0; k < topk; k++) weights[k] = scores[ids[k]] / total * scale;
+    return 1;
+}
 
 int dsv4_cuda_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
-    (void)t; (void)y; (void)x;
-    return 0;
+    if (!t || !t->vk || !y || !x || !ds4vk_op_enabled(t)) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    int ok = t->fmt == 8 || t->fmt == 9 ? ds4vk_fp8_matvec(t, y, x)
+          : t->fmt == 0 ? ds4vk_f32_matvec(t, y, x)
+          : t->fmt == 16 ? ds4vk_bf16_matvec(t, y, x) : 0;
+    if (ok) ds4vk_prof_tick(t, t0);
+    return ok;
 }
 
 int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t, float *y, const float *x,
                              int groups) {
-    (void)t; (void)y; (void)x; (void)groups;
-    return 0;
+    if (!t || !t->vk || !y || !x || groups < 1 || !ds4vk_op_enabled(t)) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    int ok = (t->fmt == 8 || t->fmt == 9) ? ds4vk_grouped_matvec(t, y, x, groups)
+            : groups == 1 ? dsv4_cuda_matvec(t, y, x) : 0;
+    if (ok) ds4vk_prof_tick(t, t0);
+    return ok;
 }
 
 int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t, const Dsv4CudaActivation *input,
@@ -402,8 +715,63 @@ int dsv4_cuda_wo(Dsv4CudaTensor *wo_a, Dsv4CudaTensor *wo_b, int groups,
 int dsv4_cuda_route(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate,
                     Dsv4CudaTensor *bias, const int *fixed_ids,
                     float routed_scale, int ids[6], float weights[6]) {
-    (void)input; (void)gate; (void)bias; (void)fixed_ids; (void)routed_scale;
-    (void)ids; (void)weights;
+    if (!input || !gate || !ids || !weights || !ds4vk_op_enabled(gate))
+        return 0;
+    if (gate->fmt != 0 || gate->O != 256 || gate->I < 1 ||
+        (size_t)gate->I > (size_t)input->elements)
+        return 0;
+    if (bias && (bias->fmt != 0 || bias->O < 256 || bias->I < 1)) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    float *logits = malloc(256 * sizeof(*logits));
+    if (!logits) return 0;
+    int ok = dsv4_cuda_matvec(gate, logits, (const float *)input->data)
+          && ds4vk_route_top6(ids, weights, logits,
+                              bias ? (const float *)coli_vk_tensor_wptr(bias->vk) : NULL,
+                              fixed_ids, 6, routed_scale);
+    free(logits);
+    if (ok) ds4vk_prof_tick(gate, t0);
+    return ok;
+}
+
+int dsv4_cuda_head_argmax(Dsv4CudaTensor *t, const float *x, int *id,
+                          float *value) {
+    /* The engine's CPU head path (head_argmax, deepseek_v4.c): scores[row] =
+     * sum_i bf16(head[row,i]) * x[i] (fp32 accumulate), winner = strictly-
+     * greatest score (first row wins ties). The GPU computes the 129280-row
+     * bf16 matvec once; the 516 KB score readback + host argmax is exact. */
+    if (!t || !t->vk || !x || !id || !value || t->fmt != 16 ||
+        !ds4vk_op_enabled(t))
+        return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    float *scores = malloc((size_t)t->O * sizeof(*scores));
+    if (!scores) return 0;
+    int ok = coli_vk_matmul(&t->vk, scores, x, NULL, NULL, 16, 1, t->I, t->O, 1);
+    if (ok) {
+        int winner = -1;
+        float maximum = -INFINITY;
+        for (int row = 0; row < t->O; row++)
+            if (scores[row] > maximum) { maximum = scores[row]; winner = row; }
+        ok = winner >= 0;
+        if (ok) { *id = winner; *value = maximum; }
+    }
+    free(scores);
+    if (ok) ds4vk_prof_tick(t, t0);
+    return ok;
+}
+
+int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,
+                           Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
+                           Dsv4CudaTensor *base, Dsv4CudaTensor *norm,
+                           Dsv4CudaTensor *head, int M, int H, float eps,
+                           float pre_eps, int *id, float *value) {
+    /* Fused mHC-mix + rmsnorm + head matvec + argmax (the CUDA DeepGEMM
+     * surface). The v1 decode path runs final_hidden (mHC mix + rmsnorm) on
+     * the CPU and calls dsv4_cuda_head_argmax directly, so this fused entry
+     * is not wired; keep it failing so the engine stays on its CPU path. */
+    (void)residual; (void)fn; (void)scale; (void)base; (void)norm; (void)head;
+    (void)M; (void)H; (void)eps; (void)pre_eps; (void)id; (void)value;
     return 0;
 }
 
@@ -477,22 +845,6 @@ int dsv4_cuda_kv_comp_append(int device, int layer, const float *rows,
                              int start_idx, int count, int dim) {
     (void)device; (void)layer; (void)rows; (void)start_idx; (void)count;
     (void)dim;
-    return 0;
-}
-
-int dsv4_cuda_head_argmax(Dsv4CudaTensor *t, const float *x, int *id,
-                          float *value) {
-    (void)t; (void)x; (void)id; (void)value;
-    return 0;
-}
-
-int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,
-                           Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
-                           Dsv4CudaTensor *base, Dsv4CudaTensor *norm,
-                           Dsv4CudaTensor *head, int M, int H, float eps,
-                           float pre_eps, int *id, float *value) {
-    (void)residual; (void)fn; (void)scale; (void)base; (void)norm; (void)head;
-    (void)M; (void)H; (void)eps; (void)pre_eps; (void)id; (void)value;
     return 0;
 }
 

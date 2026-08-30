@@ -9643,6 +9643,16 @@ void coli_v4_vk_tier_probe(void) {
 #include <stdlib.h>
 #include <math.h>
 
+/* M3a head mirror (VK tier): head.weight bf16, uploaded once at engine open
+ * from the resident head cache; the GENERATE_STATS head_argmax dispatches
+ * through it (dsv4_cuda_head_argmax). NULL when the tier is off, the head is
+ * streamed (not resident), or the upload failed — the CPU head runs then. */
+static Dsv4CudaTensor *g_vk_head;
+
+#if defined(COLI_V4_GPU_TIER_VK)
+static void v4_vk_head_upload(ColiV4Engine *engine);   /* defined after engine_open */
+#endif
+
 static int v4_gpu_wanted(void) {
 #if defined(COLI_V4_GPU_TIER_VK)
     /* VK tier is opt-in (D8): COLI_DSV4_VK_DENSE=1, or the engine-wide
@@ -9726,6 +9736,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                     "weights in Vulkan arenas; decode compute lands M3a, "
                     "falls back to CPU per D6)\n",
             device);
+    v4_vk_head_upload(engine);   /* M3a: bf16 head mirror (streamed -> CPU) */
 #else
     fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
 #endif
@@ -9756,9 +9767,56 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
             (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors);
         engine->gpu.dspark_mirrors = NULL;
     }
+#if defined(COLI_V4_GPU_TIER_VK)
+    if (g_vk_head) {
+        dsv4_cuda_tensor_free(g_vk_head);
+        g_vk_head = NULL;
+    }
+#endif
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
+}
+
+/* ---- M3a head mirror + argmax dispatch (VK tier) ----
+ * head.weight (bf16, O=vocab, I=hidden, ~1.06 GiB on the real checkpoint) is
+ * uploaded once at engine open from the resident head cache (loaded by the
+ * expert store before coli_v4_gpu_engine_open runs); the decode head_argmax
+ * then dispatches through dsv4_cuda_head_argmax (fmt=16 bf16 matvec + host
+ * argmax). Any upload failure leaves g_vk_head NULL and the CPU reference
+ * head path runs (D6). */
+#if defined(COLI_V4_GPU_TIER_VK)
+static void v4_vk_head_upload(ColiV4Engine *engine) {
+    g_vk_head = NULL;
+    if (!engine || !engine->head_cache.data) return;   /* streamed head: CPU path */
+    const ColiDeepSeekV4Config *config = &engine->config;
+    if (!config || config->vocab_size < 1 || config->hidden_size < 1) return;
+    Dsv4CudaTensor *tensor = NULL;
+    if (!dsv4_cuda_upload_bf16(&tensor,
+                               (const uint16_t *)engine->head_cache.data,
+                               config->vocab_size, config->hidden_size,
+                               engine->gpu.device))
+        return;
+    ds4vk_tensor_set_op(tensor, "head");   /* M3a per-op gating */
+    g_vk_head = tensor;
+    fprintf(stderr, "v4_gpu vk head uploaded rows=%d cols=%d (%.1f MiB; "
+                    "head argmax moves to GPU, CPU reference on any failure)\n",
+            config->vocab_size, config->hidden_size,
+            dsv4_cuda_tensor_bytes(tensor) / 1048576.0);
+    engine->gpu.uploaded_bytes += dsv4_cuda_tensor_bytes(tensor);
+}
+#endif
+
+/* Cross-unit entry used by the GENERATE_STATS unit's head_argmax (it cannot
+ * see the backend headers). Returns 0 when the GPU computed the winner. */
+int coli_v4_gpu_head_argmax(const float *hidden, int *id, float *value) {
+#if defined(COLI_V4_GPU_TIER_VK)
+    if (!g_vk_head || !hidden || !id || !value) return -1;
+    return dsv4_cuda_head_argmax(g_vk_head, hidden, id, value) ? 0 : -1;
+#else
+    (void)hidden; (void)id; (void)value;
+    return -1;
+#endif
 }
 
 /* The resident copy of an fp8 tensor may be transposed inside each 8-row tile
@@ -9828,6 +9886,24 @@ static void *v4_gpu_upload_fp8_fmt(ColiDeepSeekV4LayerWeights *weights,
         free(scale_bytes);
         return NULL;
     }
+#if defined(COLI_V4_GPU_TIER_VK)
+    /* M3a per-op gating (TEST §0.5): tag the handle with its op group so
+     * COLI_DSV4_VK_OPS can isolate one group at a time for L3 A/B. Unknown
+     * prefixes stay untagged (op NONE -> the backend refuses -> the engine's
+     * per-op dispatch falls back to CPU, D6 — a safe default). */
+    {
+        const char *op = NULL;
+        if (!strcmp(prefix, "attn.wq_a") || !strcmp(prefix, "attn.wq_b") ||
+            !strcmp(prefix, "attn.wkv"))
+            op = "qkv";
+        else if (!strcmp(prefix, "attn.wo_a") ||
+                 !strcmp(prefix, "attn.wo_b"))
+            op = "wo";
+        else if (!strncmp(prefix, "ffn.shared_experts.", 19))
+            op = "shared";
+        if (op) ds4vk_tensor_set_op(tensor, op);
+    }
+#endif
     free(row_major);
     free(scale_bytes);
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
@@ -9934,6 +10010,9 @@ static void *v4_gpu_upload_gate(ColiDeepSeekV4LayerWeights *weights, int device,
         free(f32);
         return NULL;
     }
+#if defined(COLI_V4_GPU_TIER_VK)
+    ds4vk_tensor_set_op(tensor, "route");   /* M3a per-op gating */
+#endif
     free(f32);
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
@@ -9953,6 +10032,9 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
     Dsv4CudaTensor *tensor = NULL;
     if (!dsv4_cuda_upload_f32(&tensor, data, (int)experts, 1, device))
         return NULL;
+#if defined(COLI_V4_GPU_TIER_VK)
+    ds4vk_tensor_set_op(tensor, "route");   /* M3a per-op gating */
+#endif
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -11639,6 +11721,15 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
     int d = config->hidden_size, vocab = config->vocab_size;
     if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1)
         return -1;
+#ifdef COLI_V4_GPU_TIER
+    /* M3a head (D6): the bf16 head matvec + argmax runs on the GPU when the
+     * tier uploaded the head mirror (VK tier; the CUDA tier does not wire
+     * head_argmax — dsv4_cuda_head_argmax returns 0 there, so this falls
+     * through to the CPU reference unchanged). Any backend refusal keeps the
+     * CPU path. */
+    if (coli_v4_gpu_head_argmax(hidden, best_token, best_logit) == 0)
+        return 0;
+#endif
     int shard = coli_st_tensor_shard(index, head);
     size_t resident_bytes = (size_t)vocab * (size_t)d * sizeof(uint16_t);
     const uint16_t *resident = coli_v4_head_cache_data(

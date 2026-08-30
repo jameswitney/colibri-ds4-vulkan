@@ -44,4 +44,12 @@ int ds4vk_fp8_ref_matmul(const uint8_t *w, const float *bscale,
                          int rows, int cols, int packed_rows8,
                          const float *x, int tokens, float *y);
 
+/* ---- ds4vk_* per-op surface (M3a) ----
+ * ds4vk_tensor_set_op tags an uploaded Dsv4CudaTensor with its M3a op group
+ * ("qkv"/"wo"/"route"/"head"/"shared") so the COLI_DSV4_VK_OPS per-op
+ * enable env (TEST §0.5) can gate it. The engine calls this right after each
+ * upload (it knows the tensor name; the dsv4_cuda_* ABI does not carry one).
+ * Returns 1 when the group name is known, 0 otherwise. */
+int ds4vk_tensor_set_op(Dsv4CudaTensor *t, const char *group);
+
 #endif /* COLIBRI_BACKEND_VULKAN_DSV4_H */

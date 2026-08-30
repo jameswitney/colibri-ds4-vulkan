@@ -25,6 +25,10 @@ struct ColiVkTensor {
     size_t wbytes;
     int fmt, I, O, rowWords, gs;
     int dev;               /* 0 = primary device, 1 = the COLI_VK_DEV2 expert-tier device */
+    /* Stable mapped host pointers of the arena allocations (HOST_VISIBLE
+     * memory), exposed via coli_vk_tensor_wptr/sptr for the dsv4 backend to
+     * slice block-diagonal weights into per-group tensors (M3a wo_a). */
+    void *whost, *shost;
 };
 
 typedef struct {
@@ -257,6 +261,8 @@ static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt
 static int rowwords(int fmt, int I) {
     size_t rb = fmt == 1 ? (size_t)I                         // bytes/row on CPU side
               : fmt == 8 ? (size_t)I                         // fp8-e4m3: raw bytes, 1 per element
+              : fmt == 16 ? (size_t)I * 2                    // bf16: 2 bytes per element (dsv4 head)
+              : fmt == 0 ? (size_t)I * 4                     // f32: 4 bytes per element (dsv4 route gate)
               : fmt == 5 ? ((size_t)I + 63) / 64 * 24        // int3-g64: 24B per 64-group
               : (size_t)(I + 1) / 2;
     return (int)((rb + 3) / 4);                              // padded to uint32 (24|4: exact)
@@ -271,6 +277,7 @@ static size_t scale_floats(int fmt, int I, int O, int gs) {
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
     if (fmt == 8)
         return (size_t)((O + 127) / 128) * (((size_t)I + 127) / 128);  // per 128x128 block
+    if (fmt == 0 || fmt == 16) return 1;   // unquantized (f32/bf16): dummy scale slot, never read
     return (size_t)O;
 }
 
@@ -608,7 +615,7 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&              /* fmt=4/7: word-aligned groups only */
+    if (fmt != 0 && fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 && fmt != 16 &&  /* fmt=4/7: word-aligned groups only */
         !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
@@ -616,6 +623,8 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
     size_t cpu_rb = fmt == 1 ? (size_t)I
                   : fmt == 8 ? (size_t)I             // fp8-e4m3: raw bytes, byte-identical (D4)
+                  : fmt == 16 ? (size_t)I * 2        // bf16
+                  : fmt == 0 ? (size_t)I * 4         // f32
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64); fmt=8: ceil(O/128)*ceil(I/128)
     t->wbytes = stride * (size_t)O;
@@ -631,9 +640,12 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
     }
     if (fmt == 8) {                                    // E8M0 codes -> fp32 blocks, bitwise (D4)
         coli_vk_expand_e8m0((const uint8_t *)scales, (float *)sptr, sfl);
-    } else {
+    } else if (sfl && scales) {
         memcpy(sptr, scales, sfl * sizeof(float));
+    } else {
+        memset(sptr, 0, sfl * sizeof(float));          // fmt 0/16: unquantized — dummy scale slot
     }
+    t->whost = wptr; t->shost = sptr;
     // Counters are touched concurrently: frees run from expert_load under
     // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
     __atomic_add_fetch(&G.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
@@ -1086,7 +1098,7 @@ static int arena_suballoc_d2(size_t bytes, VkBuffer *buf, void **ptr) {
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
     if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
-    if (fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 &&
+    if (fmt != 0 && fmt != 1 && fmt != 2 && fmt != 5 && fmt != 8 && fmt != 16 &&
         !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return 0;
@@ -1095,6 +1107,8 @@ static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float
     size_t stride = (size_t)t->rowWords * 4;
     size_t cpu_rb = fmt == 1 ? (size_t)I
                   : fmt == 8 ? (size_t)I
+                  : fmt == 16 ? (size_t)I * 2
+                  : fmt == 0 ? (size_t)I * 4
                   : fmt == 5 ? ((size_t)I + 63) / 64 * 24 : (size_t)(I + 1) / 2;
     size_t sfl = scale_floats(fmt, I, O, gs);
     t->wbytes = stride * (size_t)O;
@@ -1110,9 +1124,12 @@ static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float
     }
     if (fmt == 8) {
         coli_vk_expand_e8m0((const uint8_t *)scales, (float *)sptr, sfl);
-    } else {
+    } else if (sfl && scales) {
         memcpy(sptr, scales, sfl * sizeof(float));
+    } else {
+        memset(sptr, 0, sfl * sizeof(float));          // fmt 0/16: unquantized — dummy scale slot
     }
+    t->whost = wptr; t->shost = sptr;
     __atomic_add_fetch(&G2.used_bytes, t->wbytes + sfl * sizeof(float), __ATOMIC_RELAXED);
     __atomic_add_fetch(&G2.tensor_count, 1, __ATOMIC_RELAXED);
     *out = t;
@@ -1703,6 +1720,9 @@ void coli_vk_tensor_free(ColiVkTensor *t) {
 }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
+
+const void *coli_vk_tensor_wptr(const ColiVkTensor *t) { return t ? t->whost : NULL; }
+const void *coli_vk_tensor_sptr(const ColiVkTensor *t) { return t ? t->shost : NULL; }
 
 void coli_vk_shutdown(void) {
     if (!G.ready) return;

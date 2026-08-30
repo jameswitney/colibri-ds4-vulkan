@@ -147,6 +147,16 @@ int  coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const f
 void   coli_vk_tensor_free(ColiVkTensor *t);
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t);
 
+/* M3a dsv4 grouped matvec: the arena memory is HOST_VISIBLE, so the dsv4
+ * backend can read a resident tensor's bytes back through these stable
+ * mapped pointers to slice a block-diagonal weight matrix (wo_a: groups of
+ * o_rank x group_width stacked vertically) into per-group tensors. wptr is
+ * the padded row layout (row stride = rowWords*4, same as the shader reads);
+ * sptr is the expanded fp32 scale array (fmt=8: ceil(O/128)*ceil(I/128)).
+ * NULL when the backend is not up or the tensor has no buffer. */
+const void *coli_vk_tensor_wptr(const ColiVkTensor *t);
+const void *coli_vk_tensor_sptr(const ColiVkTensor *t);
+
 #ifdef __cplusplus
 }
 #endif
