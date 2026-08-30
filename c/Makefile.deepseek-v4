@@ -366,6 +366,20 @@ test-vk-dsv4-attn: shaders/qmatmul.spv shaders/sparse_attn.spv $(VK_ATTN_ORACLE_
 	./tests/test_dsv4_sparse_attn_vk
 endif
 
+# L2 mHC pre/post parity (TEST.md §2 L2 / M3c): the per-layer
+# hyper-connection (fn matvec + sinkhorn + pre*residual input + norm rmsnorm,
+# and the post sum) vs the REAL engine CPU functions — the MATH unit
+# (coli_v4_hc_pre/hc_post/rmsnorm) + NATIVE_QUANT (bf16 round) linked
+# without the GPU-tier defines (pure-CPU reference, gc-sections). The test
+# sets COLI_DSV4_VK_OPS=mhc so the op-group tag is exercised both ways.
+.PHONY: test-vk-dsv4-mhc
+ifeq ($(VK),1)
+test-vk-dsv4-mhc: shaders/qmatmul.spv tests/test_dsv4_mhc_vk.c $(VK_OPS_ORACLE_OBJS)
+	$(CC) -O2 -I. tests/test_dsv4_mhc_vk.c backend_vulkan.c backend_vulkan_dsv4.c \
+		$(VK_OPS_ORACLE_OBJS) -o tests/test_dsv4_mhc_vk -lvulkan -lm -fopenmp -pthread -Wl,--gc-sections
+	./tests/test_dsv4_mhc_vk
+endif
+
 # dsv4 Vulkan op surface (M1-3 seam): same-named dsv4_cuda_* ABI over the
 # ds4vk_* implementation landing in M2-M3. Plain C, no ICD dependency — the
 # stub compiles and links on any box (TEST L0 seam completeness).

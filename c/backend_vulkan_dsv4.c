@@ -73,6 +73,7 @@ typedef enum {
     DS4VK_OP_HEAD,
     DS4VK_OP_SHARED,
     DS4VK_OP_ATTN,
+    DS4VK_OP_MHC,
     DS4VK_OP_COUNT
 } Ds4vkOp;
 
@@ -84,6 +85,7 @@ static const char *ds4vk_op_name(Ds4vkOp op) {
     case DS4VK_OP_HEAD: return "head";
     case DS4VK_OP_SHARED: return "shared";
     case DS4VK_OP_ATTN: return "attn";
+    case DS4VK_OP_MHC: return "mhc";
     default: return "none";
     }
 }
@@ -141,6 +143,14 @@ static int ds4vk_op_enabled_g(void) {
     int mask = ds4vk_op_mask();
     if (mask < 0) return 1;
     return (mask >> DS4VK_OP_ATTN) & 1;
+}
+
+/* mHC post has no weight handle either (post/comb ride in the state
+ * activation) — gate its group directly, like the attention core. */
+static int ds4vk_op_enabled_g_mhc(void) {
+    int mask = ds4vk_op_mask();
+    if (mask < 0) return 1;
+    return (mask >> DS4VK_OP_MHC) & 1;
 }
 
 /* ---- per-op wall timing (VK_PROF=1, the backend's own gate) ---- */
@@ -880,15 +890,237 @@ int dsv4_cuda_kv_comp_append(int device, int layer, const float *rows,
     return coli_vk_dsv4_kv_comp_append(layer, rows, start_idx, count, dim);
 }
 
+/* ---- mHC pre/post (M3c-1): the per-layer hyper-connection, decode path ----
+ * Each op mirrors the CPU chain the engine's block_token_impl/pipeline calls
+ * (deepseek_v4.c block_token_*): normalized_hc_pre = coli_v4_hc_pre (fn
+ * matvec + RMS inv + sinkhorn pre/post/comb) + bf16 round + rmsnorm with the
+ * branch norm + bf16 round; coli_v4_hc_post = post[j]*x[h] +
+ * comb[i*M+j]*residual[i*H+h], bf16-rounded. The fn matvec is the ONLY heavy
+ * term (N x M*H f32, ~1.5 MB per layer at N=24/M=4/H=4096) — it runs on the
+ * GPU through the shared fmt=0 qmatmul path (the M2-4-verified matmul
+ * primitive, thresholded vs the CPU's sequential fp32, same contract as the
+ * CUDA tier's split accumulation). Everything downstream (the RMS inverse,
+ * the sinkhorn iterations, the pre*residual / post*residual sums, the bf16
+ * rounding points, the norm rmsnorm) is host-side sequential fp32 — BITWISE
+ * vs the CPU reference, exactly like the engine's own CPU code (the CUDA
+ * tier computes these in shaders and is thresholded there; the VK tier
+ * matches the CPU chain more faithfully, the same choice as G9's QDQ).
+ * state layout matches the CUDA ABI: [post M][comb M*M][pre M]. */
+
+/* bf16 round-to-nearest-even, mirroring coli_bf16_round (deepseek_v4.c) —
+ * identical bit arithmetic including the inf/nan pass-through. */
+static float ds4vk_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        uint32_t tie = (bits >> 16) & 1u;
+        bits += 0x7fffu + tie;
+    }
+    bits &= 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/* sigmoidf_stable (deepseek_v4.c MATH unit): expf in the same branches, so
+ * the result is bitwise vs the engine given the same input. */
+static float ds4vk_sigmoid(float value) {
+    if (value >= 0.0f) {
+        float decay = expf(-value);
+        return 1.0f / (1.0f + decay);
+    }
+    float growth = expf(value);
+    return growth / (1.0f + growth);
+}
+
+/* Port of coli_v4_hc_split_sinkhorn (deepseek_v4.c MATH unit) — the same
+ * sequential fp32 ops in the same order (softmax per row with max
+ * subtraction, +eps, one column normalize, then (iterations-1) rounds of
+ * row+column normalize), so pre/post/comb are bitwise vs the CPU given the
+ * same mixes/scale/base. pre_eps/post_mult follow the CUDA ABI (the CPU
+ * chain calls it with hc_eps / 2.0f — the engine wrapper passes exactly
+ * those, so the results are identical). M <= 16 fits the stack array (the
+ * config loader validates hc_mult <= 16; the real model uses 4). */
+static int ds4vk_mhc_sinkhorn(float *pre, float *post, float *comb,
+                              const float *mixes, const float scale[3],
+                              const float *base, int M, int iterations,
+                              float pre_eps, float post_mult, float eps) {
+    if (!pre || !post || !comb || !mixes || !scale || !base ||
+        M < 1 || M > 16 || iterations < 1 || eps < 0.0f)
+        return 0;
+    for (int index = 0; index < M; index++) {
+        pre[index] = ds4vk_sigmoid(mixes[index] * scale[0] + base[index]) +
+                     pre_eps;
+        post[index] = post_mult *
+                      ds4vk_sigmoid(mixes[M + index] * scale[1] +
+                                    base[M + index]);
+    }
+    int offset = 2 * M;
+    for (int row = 0; row < M; row++) {
+        float maximum = -INFINITY;
+        for (int column = 0; column < M; column++) {
+            int index = offset + row * M + column;
+            float value = mixes[index] * scale[2] + base[index];
+            comb[row * M + column] = value;
+            if (value > maximum) maximum = value;
+        }
+        float sum = 0.0f;
+        for (int column = 0; column < M; column++) {
+            float value = expf(comb[row * M + column] - maximum);
+            comb[row * M + column] = value;
+            sum += value;
+        }
+        for (int column = 0; column < M; column++)
+            comb[row * M + column] = comb[row * M + column] / sum + eps;
+    }
+    float sums[16];
+    for (int column = 0; column < M; column++) {
+        float sum = 0.0f;
+        for (int row = 0; row < M; row++)
+            sum += comb[row * M + column];
+        sums[column] = sum;
+    }
+    for (int row = 0; row < M; row++)
+        for (int column = 0; column < M; column++)
+            comb[row * M + column] /= sums[column] + eps;
+    for (int iteration = 1; iteration < iterations; iteration++) {
+        for (int row = 0; row < M; row++) {
+            float sum = 0.0f;
+            for (int column = 0; column < M; column++)
+                sum += comb[row * M + column];
+            sums[row] = sum;
+        }
+        for (int row = 0; row < M; row++)
+            for (int column = 0; column < M; column++)
+                comb[row * M + column] /= sums[row] + eps;
+        for (int column = 0; column < M; column++) {
+            float sum = 0.0f;
+            for (int row = 0; row < M; row++)
+                sum += comb[row * M + column];
+            sums[column] = sum;
+        }
+        for (int row = 0; row < M; row++)
+            for (int column = 0; column < M; column++)
+                comb[row * M + column] /= sums[column] + eps;
+    }
+    return 1;
+}
+
+/* Shared body of dsv4_cuda_mhc_pre/_pre_norm: fn matvec on the GPU (fmt=0),
+ * then host-side inv/scale/base + sinkhorn into state (post+comb+pre) and
+ * the pre*residual input. norm == NULL -> plain input (bf16 round only);
+ * norm != NULL -> input_norm (bf16 round, then rmsnorm with the branch norm
+ * weight, then bf16 round) — exactly normalized_hc_pre. */
+static int ds4vk_mhc_pre_common(const Dsv4CudaActivation *residual,
+                                Dsv4CudaTensor *fn, Dsv4CudaTensor *scale,
+                                Dsv4CudaTensor *base, Dsv4CudaTensor *norm,
+                                int M, int H, float rms_eps, float pre_eps,
+                                float sink_eps, float post_mult,
+                                int sink_iters, float norm_eps,
+                                Dsv4CudaActivation *state,
+                                Dsv4CudaActivation *input) {
+    int N = 2 * M + M * M, MH = M * H;
+    if (!residual || !residual->data || !fn || !scale || !base || !state ||
+        !input || M < 1 || H < 1 || N < 1 || MH < 1 ||
+        residual->elements < MH || state->elements < M + M * M + M ||
+        input->elements < H ||
+        fn->fmt != 0 || scale->fmt != 0 || base->fmt != 0 ||
+        (norm && norm->fmt != 0) || fn->O != N || fn->I != MH ||
+        scale->O * scale->I < 3 || base->O * base->I < N ||
+        (norm && norm->O * norm->I < H) || !fn->vk || !ds4vk_op_enabled(fn))
+        return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    /* The VK backend's activations hold a HOST copy (allocated lazily on
+     * upload); the pre writes state/input directly, so ensure the buffers
+     * exist when the engine did not upload them (the CUDA tier allocates
+     * device storage at create — same contract). */
+    if (!state->data) {
+        state->data = calloc((size_t)state->elements, sizeof(float));
+        if (!state->data) return 0;
+    }
+    if (!input->data) {
+        input->data = calloc((size_t)input->elements, sizeof(float));
+        if (!input->data) return 0;
+    }
+    /* fn matvec: mix_raw[n] = sum_i fn[n][i]*residual[i] (GPU, fp32
+     * tree/warp order — the same contract as the M2-4 matmul; the CUDA tier
+     * splits the same sum over 8 parts). */
+    float *mixes = malloc((size_t)N * sizeof(*mixes));
+    if (!mixes) return 0;
+    int ok = coli_vk_matmul(&fn->vk, mixes, residual->data, NULL, NULL, 0, 1,
+                            MH, N, 1);
+    if (ok) {
+        /* RMS inverse + scale/base, bitwise vs coli_v4_hc_pre (sequential
+         * fp32 mean-square, 1/sqrtf, ((sum*inv)*scale[group])+base). */
+        const float *sc = coli_vk_tensor_wptr(scale->vk);
+        const float *bs = coli_vk_tensor_wptr(base->vk);
+        if (!sc || !bs) {
+            ok = 0;
+        } else {
+            float mean_square = 0.0f;
+            for (int i = 0; i < MH; i++)
+                mean_square += residual->data[i] * residual->data[i];
+            float inverse_rms = 1.0f / sqrtf(mean_square / MH + rms_eps);
+            /* coli_v4_hc_pre: mixes[row] = sum * inverse_rms (NO scale/base
+             * yet — the sinkhorn applies them, exactly like the CPU chain). */
+            for (int n = 0; n < N; n++)
+                mixes[n] = mixes[n] * inverse_rms;
+            float *post = state->data;
+            float *comb = state->data + M;
+            float *pre = state->data + M + M * M;
+            ok = ds4vk_mhc_sinkhorn(pre, post, comb, mixes, sc, bs, M,
+                                    sink_iters, pre_eps, post_mult,
+                                    sink_eps);
+        }
+    }
+    if (ok) {
+        /* input[h] = bf16(sum_i pre[i]*residual[i*H+h]) — sequential fp32 in
+         * the CPU's order (coli_v4_hc_pre), then the bf16 round point. */
+        const float *pre = state->data + M + M * M;
+        float *reduced = input->data;
+        for (int h = 0; h < H; h++) {
+            float v = 0.0f;
+            for (int i = 0; i < M; i++)
+                v += pre[i] * residual->data[(size_t)i * H + h];
+            reduced[h] = ds4vk_bf16(v);
+        }
+        if (norm) {
+            /* normalized_hc_pre's rmsnorm: mean-square over the bf16-rounded
+             * reduced values, inv = 1/sqrt(ss/H + norm_eps), out =
+             * bf16(reduced*inv*norm) — same ops as coli_v4_rmsnorm +
+             * coli_bf16_round_array. */
+            const float *w = coli_vk_tensor_wptr(norm->vk);
+            if (!w) {
+                ok = 0;
+            } else {
+                float mean_square = 0.0f;
+                for (int h = 0; h < H; h++)
+                    mean_square += reduced[h] * reduced[h];
+                float inverse_rms = 1.0f / sqrtf(mean_square / H + norm_eps);
+                for (int h = 0; h < H; h++)
+                    reduced[h] = ds4vk_bf16(reduced[h] * inverse_rms * w[h]);
+            }
+        }
+    }
+    free(mixes);
+    if (ok) ds4vk_prof_tick(fn, t0);
+    return ok;
+}
+
 int dsv4_cuda_mhc_pre(const Dsv4CudaActivation *residual, Dsv4CudaTensor *fn,
                       Dsv4CudaTensor *scale, Dsv4CudaTensor *base, int M, int H,
                       float rms_eps, float pre_eps, float sink_eps,
                       float post_mult, int sink_iters, Dsv4CudaActivation *state,
                       Dsv4CudaActivation *input) {
-    (void)residual; (void)fn; (void)scale; (void)base; (void)M; (void)H;
-    (void)rms_eps; (void)pre_eps; (void)sink_eps; (void)post_mult;
-    (void)sink_iters; (void)state; (void)input;
-    return 0;
+    /* plain mHC pre: the raw input (bf16-rounded pre*residual), no norm —
+     * the CUDA mhc_input contract. The v1 decode path uses the _norm
+     * variant (normalized_hc_pre); this entry exists for ABI completeness
+     * and the CUDA-test surface. pre_eps/post_mult mirror the CUDA coeff
+     * kernel's handling (post_mult multiplies post; pre_eps is unused by
+     * the CPU chain — sigmoid + hc_eps). */
+    return ds4vk_mhc_pre_common(residual, fn, scale, base, NULL, M, H,
+                                rms_eps, pre_eps, sink_eps, post_mult,
+                                sink_iters, 0.0f, state, input);
 }
 
 int dsv4_cuda_mhc_pre_norm(const Dsv4CudaActivation *residual,
@@ -897,10 +1129,9 @@ int dsv4_cuda_mhc_pre_norm(const Dsv4CudaActivation *residual,
                            int H, float rms_eps, float pre_eps, float sink_eps,
                            float post_mult, int sink_iters, float norm_eps,
                            Dsv4CudaActivation *state, Dsv4CudaActivation *input) {
-    (void)residual; (void)fn; (void)scale; (void)base; (void)norm; (void)M;
-    (void)H; (void)rms_eps; (void)pre_eps; (void)sink_eps; (void)post_mult;
-    (void)sink_iters; (void)norm_eps; (void)state; (void)input;
-    return 0;
+    return ds4vk_mhc_pre_common(residual, fn, scale, base, norm, M, H,
+                                rms_eps, pre_eps, sink_eps, post_mult,
+                                sink_iters, norm_eps, state, input);
 }
 
 int dsv4_cuda_mhc_pre_norm_batch(const Dsv4CudaActivation *residual,
@@ -926,8 +1157,38 @@ int dsv4_cuda_mhc_post(const Dsv4CudaActivation *x,
                        const Dsv4CudaActivation *residual,
                        const Dsv4CudaActivation *state, int M, int H,
                        Dsv4CudaActivation *out) {
-    (void)x; (void)residual; (void)state; (void)M; (void)H; (void)out;
-    return 0;
+    /* coli_v4_hc_post: out[j*H+h] = bf16(post[j]*x[h] + sum_i
+     * comb[i*M+j]*residual[i*H+h]) — sequential fp32 in the CPU's order,
+     * bf16 round at the same point (the engine's extra coli_bf16_round_array
+     * after the call is a no-op on the already-rounded values). post/comb
+     * come from state ([post M][comb M*M]); gated on the op group via a
+     * synthetic tensor anchored to DS4VK_OP_MHC (the op has no weight
+     * handle — same pattern as the attention core). */
+    if (!x || !x->data || !residual || !residual->data || !state ||
+        !state->data || !out || M < 1 || H < 1 ||
+        x->elements < H || residual->elements < M * H ||
+        state->elements < M + M * M + M || out->elements < M * H ||
+        !ds4vk_op_enabled_g_mhc())
+        return 0;
+    if (!out->data) {
+        out->data = calloc((size_t)out->elements, sizeof(float));
+        if (!out->data) return 0;
+    }
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    const float *post = state->data;
+    const float *comb = state->data + M;
+    for (int j = 0; j < M; j++) {
+        for (int h = 0; h < H; h++) {
+            float v = post[j] * x->data[h];
+            for (int i = 0; i < M; i++)
+                v += comb[i * M + j] * residual->data[(size_t)i * H + h];
+            out->data[(size_t)j * H + h] = ds4vk_bf16(v);
+        }
+    }
+    Dsv4CudaTensor fake; memset(&fake, 0, sizeof(fake)); fake.op = DS4VK_OP_MHC;
+    ds4vk_prof_tick(&fake, t0);
+    return 1;
 }
 
 int dsv4_cuda_mhc_post_pre(const Dsv4CudaActivation *x,

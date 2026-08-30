@@ -4402,22 +4402,68 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "out of memory in block");
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
-    int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
+    /* M3c-1: the per-token mHC pre (normalized_hc_pre, attn branch) on the
+     * GPU — the fn matvec offloads; the sinkhorn/input stay host-side
+     * (bitwise vs the CPU chain). The VK tier only; any refusal falls back
+     * to the CPU reference (D6). */
+    int gpu_hc1 = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+    if (coli_v4_gpu_mhc_pre_norm(weights, "attn", "attn_norm", post, comb,
+                                 normalized, input_hc, hc, d,
+                                 config->rms_norm_eps, config->hc_eps,
+                                 config->hc_sinkhorn_iters) == 0)
+        gpu_hc1 = 1;
+#endif
+    int result = 0;
+    if (!gpu_hc1)
+        result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
-    if (!result) result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
-    if (!result) coli_bf16_round_array(state, hd);
+    /* M3c-1: mHC post (coli_v4_hc_post) on the GPU; the backend bf16-rounds
+     * at the same point, so the CPU round below is skipped on the GPU path. */
+    if (!result) {
+        int gpu_post = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+        if (coli_v4_gpu_mhc_post(weights, state, branch, residual, post, comb,
+                                 hc, d) == 0)
+            gpu_post = 1;
+#endif
+        if (!gpu_post) {
+            result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
+            if (!result) coli_bf16_round_array(state, hd);
+        }
+    }
 
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
-    if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
-                                            weights, config, "ffn", "ffn_norm.weight");
+    int gpu_hc2 = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+    if (!result &&
+        coli_v4_gpu_mhc_pre_norm(weights, "ffn", "ffn_norm", post, comb,
+                                 normalized, state, hc, d,
+                                 config->rms_norm_eps, config->hc_eps,
+                                 config->hc_sinkhorn_iters) == 0)
+        gpu_hc2 = 1;
+#endif
+    if (!gpu_hc2)
+        result = normalized_hc_pre(reduced, post, comb, normalized, state,
+                                   weights, config, "ffn", "ffn_norm.weight");
     if (!result) result = moe_token(branch, weights, config, experts, normalized, token);
-    if (!result) result = coli_v4_hc_post(output_hc, branch, residual, post, comb, hc, d);
-    if (!result) coli_bf16_round_array(output_hc, hd);
+    if (!result) {
+        int gpu_post = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+        if (coli_v4_gpu_mhc_post(weights, output_hc, branch, residual, post,
+                                 comb, hc, d) == 0)
+            gpu_post = 1;
+#endif
+        if (!gpu_post) {
+            result = coli_v4_hc_post(output_hc, branch, residual, post, comb, hc, d);
+            if (!result) coli_bf16_round_array(output_hc, hd);
+        }
+    }
 
     free(comb); free(post); free(branch); free(normalized);
     free(reduced); free(state); free(residual);
@@ -5351,7 +5397,19 @@ static int block_token_pipeline(float *output_hc,
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
-    int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
+    /* M3c-1: the per-token mHC pre (normalized_hc_pre, attn branch) on the
+     * GPU (VK tier only; any refusal falls back to the CPU reference, D6). */
+    int gpu_hc1 = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+    if (coli_v4_gpu_mhc_pre_norm(weights, "attn", "attn_norm", post, comb,
+                                 normalized, input_hc, hc, d,
+                                 config->rms_norm_eps, config->hc_eps,
+                                 config->hc_sinkhorn_iters) == 0)
+        gpu_hc1 = 1;
+#endif
+    int result = 0;
+    if (!gpu_hc1)
+        result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
     DP_MARK(dp_hc);
     if (!result) result = attention
@@ -5360,20 +5418,52 @@ static int block_token_pipeline(float *output_hc,
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
     DP_MARK(dp_attn);
-    if (!result) result = coli_v4_hc_post(state, branch, residual,
-                                          post, comb, hc, d);
-    if (!result) coli_bf16_round_array(state, hd);
+    /* M3c-1: mHC post (coli_v4_hc_post) on the GPU; the backend bf16-rounds
+     * at the same point, so the CPU round below is skipped on the GPU path. */
+    if (!result) {
+        int gpu_post = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+        if (coli_v4_gpu_mhc_post(weights, state, branch, residual, post, comb,
+                                 hc, d) == 0)
+            gpu_post = 1;
+#endif
+        if (!gpu_post) {
+            result = coli_v4_hc_post(state, branch, residual,
+                                     post, comb, hc, d);
+            if (!result) coli_bf16_round_array(state, hd);
+        }
+    }
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
-    if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
-                                            weights, config, "ffn",
-                                            "ffn_norm.weight");
+    int gpu_hc2 = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+    if (!result &&
+        coli_v4_gpu_mhc_pre_norm(weights, "ffn", "ffn_norm", post, comb,
+                                 normalized, state, hc, d,
+                                 config->rms_norm_eps, config->hc_eps,
+                                 config->hc_sinkhorn_iters) == 0)
+        gpu_hc2 = 1;
+#endif
+    if (!gpu_hc2)
+        result = normalized_hc_pre(reduced, post, comb, normalized, state,
+                                   weights, config, "ffn",
+                                   "ffn_norm.weight");
     DP_MARK(dp_hc);
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
-    if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
-                                          post, comb, hc, d);
-    if (!result) coli_bf16_round_array(output_hc, hd);
+    if (!result) {
+        int gpu_post = 0;
+#if defined(COLI_V4_GPU_TIER_VK)
+        if (coli_v4_gpu_mhc_post(weights, output_hc, branch, residual, post,
+                                 comb, hc, d) == 0)
+            gpu_post = 1;
+#endif
+        if (!gpu_post) {
+            result = coli_v4_hc_post(output_hc, branch, residual,
+                                     post, comb, hc, d);
+            if (!result) coli_bf16_round_array(output_hc, hd);
+        }
+    }
     DP_MARK(dp_hc);
     if (dprof) dp_layers++;
 #undef DP_MARK
@@ -9932,6 +10022,9 @@ static void *v4_gpu_upload_f32_tensor(ColiDeepSeekV4LayerWeights *weights,
     if (!dsv4_cuda_upload_f32(&tensor, (const float *)data, rows, columns,
                               device))
         return NULL;
+#if defined(COLI_V4_GPU_TIER_VK)
+    ds4vk_tensor_set_op(tensor, "mhc");   /* M3c-1 per-op gating */
+#endif
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -9959,6 +10052,9 @@ static void *v4_gpu_upload_norm_f32(ColiDeepSeekV4LayerWeights *weights,
     int uploaded = dsv4_cuda_upload_f32(&tensor, decoded, dimension, 1, device);
     free(decoded);
     if (!uploaded) return NULL;
+#if defined(COLI_V4_GPU_TIER_VK)
+    ds4vk_tensor_set_op(tensor, "mhc");   /* M3c-1 per-op gating */
+#endif
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -11501,6 +11597,107 @@ int coli_v4_gpu_mhc_post_batch(
          dsv4_cuda_activation_upload(state, state_host, sh)) &&
         dsv4_cuda_activation_upload(x, branch, xh) &&
         dsv4_cuda_mhc_post_batch(x, residual, state, batch, hidden, out) &&
+        dsv4_cuda_activation_download(outputs_hc, out, rh) &&
+        dsv4_cuda_activation_sync(out);
+    free(state_host);
+    return good ? 0 : -1;
+}
+
+/* ---- Decode-path mHC (M3c-1): single-token wrappers ----
+ * block_token_impl / block_token_pipeline call normalized_hc_pre (attn and
+ * ffn branches) and coli_v4_hc_post per token; these wrappers run the same
+ * math through the single-token dsv4_cuda_mhc_pre_norm/_post ABI (the fn
+ * matvec on the GPU, sinkhorn/input/post host-side — bitwise vs the CPU
+ * chain, TEST L2). Any refusal returns non-zero and the block falls back to
+ * the CPU functions (D6). The call sites are COLI_V4_GPU_TIER_VK-guarded so
+ * the CUDA tier's decode behavior is unchanged. The mHC mirrors are shared
+ * with the batched wrappers (same v4_gpu_mhc_mirror slots + residency
+ * tags). eps/iterations come from the config, exactly the values
+ * normalized_hc_pre passes to coli_v4_hc_pre. */
+int coli_v4_gpu_mhc_pre_norm(
+    const ColiDeepSeekV4LayerWeights *weights, const char *branch,
+    const char *norm_key, float *posts, float *combs, float *normalized,
+    const float *inputs_hc, int hc, int hidden, float rms_eps, float hc_eps,
+    int sink_iters) {
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !branch || !norm_key ||
+        !posts || !combs || !normalized || !inputs_hc || hc < 1 || hidden < 1)
+        return -1;
+    char key[64];
+    snprintf(key, sizeof(key), "hc_%s_fn", branch);
+    Dsv4CudaTensor *fn = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, key);
+    snprintf(key, sizeof(key), "hc_%s_scale", branch);
+    Dsv4CudaTensor *scale = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, key);
+    snprintf(key, sizeof(key), "hc_%s_base", branch);
+    Dsv4CudaTensor *base = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, key);
+    Dsv4CudaTensor *norm = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, norm_key);
+    if (!fn || !scale || !base || !norm) return -1;
+    int device = dsv4_cuda_tensor_device(fn);
+    if (device < 0) return -1;
+    long long rh = (long long)hc * hidden;
+    long long sh = (long long)(hc + hc * hc + hc);   /* post + comb + pre slots */
+    long long xh = hidden;
+    Dsv4CudaActivation *residual = v4_gpu_mhc_mirror(0, device, rh);
+    Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
+    Dsv4CudaActivation *input = v4_gpu_mhc_mirror(2, device, xh);
+    float *state_host = malloc((size_t)sh * sizeof(*state_host));
+    int good = residual && state && input && state_host &&
+        dsv4_cuda_activation_upload(residual, inputs_hc, rh) &&
+        dsv4_cuda_mhc_pre_norm(residual, fn, scale, base, norm, hc, hidden,
+                               rms_eps, hc_eps, hc_eps, 2.0f, sink_iters,
+                               rms_eps, state, input) &&
+        dsv4_cuda_activation_download(state_host, state, sh) &&
+        dsv4_cuda_activation_download(normalized, input, xh) &&
+        dsv4_cuda_activation_sync(input);
+    if (good) {
+        memcpy(posts, state_host, (size_t)hc * sizeof(*posts));
+        memcpy(combs, state_host + hc, (size_t)hc * hc * sizeof(*combs));
+        v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){residual, inputs_hc, rh};
+        v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){state, posts, sh};
+    } else {
+        v4_gpu_mhc_res_tag = (struct V4GpuMhcTag){0};
+        v4_gpu_mhc_state_tag = (struct V4GpuMhcTag){0};
+    }
+    free(state_host);
+    return good ? 0 : -1;
+}
+
+int coli_v4_gpu_mhc_post(const ColiDeepSeekV4LayerWeights *weights,
+                         float *outputs_hc, const float *branch,
+                         const float *residual_hc, const float *posts,
+                         const float *combs, int hc, int hidden) {
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !outputs_hc ||
+        !branch || !residual_hc || !posts || !combs || hc < 1 || hidden < 1)
+        return -1;
+    Dsv4CudaTensor *anchor =
+        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "hc_attn_fn");
+    if (!anchor) return -1;
+    int device = dsv4_cuda_tensor_device(anchor);
+    if (device < 0) return -1;
+    long long rh = (long long)hc * hidden;
+    long long sh = (long long)(hc + hc * hc + hc);   /* post + comb + pre slots */
+    long long xh = hidden;
+    Dsv4CudaActivation *residual = v4_gpu_mhc_mirror(0, device, rh);
+    Dsv4CudaActivation *state = v4_gpu_mhc_mirror(1, device, sh);
+    Dsv4CudaActivation *x = v4_gpu_mhc_mirror(2, device, xh);
+    Dsv4CudaActivation *out = v4_gpu_mhc_mirror(3, device, rh);
+    int res_resident =
+        v4_gpu_mhc_tag_hit(&v4_gpu_mhc_res_tag, residual, residual_hc, rh);
+    int state_resident =
+        v4_gpu_mhc_tag_hit(&v4_gpu_mhc_state_tag, state, posts, sh);
+    float *state_host = NULL;
+    if (!state_resident) {
+        state_host = malloc((size_t)sh * sizeof(*state_host));
+        if (!state_host) return -1;
+        memcpy(state_host, posts, (size_t)hc * sizeof(*posts));
+        memcpy(state_host + hc, combs, (size_t)hc * hc * sizeof(*combs));
+    }
+    int good = residual && state && x && out &&
+        (res_resident ||
+         dsv4_cuda_activation_upload(residual, residual_hc, rh)) &&
+        (state_resident ||
+         dsv4_cuda_activation_upload(state, state_host, sh)) &&
+        dsv4_cuda_activation_upload(x, branch, xh) &&
+        dsv4_cuda_mhc_post(x, residual, state, hc, hidden, out) &&
         dsv4_cuda_activation_download(outputs_hc, out, rh) &&
         dsv4_cuda_activation_sync(out);
     free(state_host);

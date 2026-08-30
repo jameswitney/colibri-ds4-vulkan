@@ -851,6 +851,19 @@ int coli_v4_gpu_mhc_post_batch(
     const ColiDeepSeekV4LayerWeights *weights, float *outputs_hc,
     const float *branch, const float *residual_hc, const float *posts,
     const float *combs, int hc, int hidden, int batch);
+/* Decode-path mHC (M3c-1): single-token normalized_hc_pre / coli_v4_hc_post
+ * through the hc_<branch>_fn/scale/base + norm f32 mirrors. eps/iterations
+ * come from the config (the same values normalized_hc_pre passes). Returns 0
+ * on success; the block caller falls back to the CPU functions otherwise. */
+int coli_v4_gpu_mhc_pre_norm(
+    const ColiDeepSeekV4LayerWeights *weights, const char *branch,
+    const char *norm_key, float *posts, float *combs, float *normalized,
+    const float *inputs_hc, int hc, int hidden, float rms_eps, float hc_eps,
+    int sink_iters);
+int coli_v4_gpu_mhc_post(const ColiDeepSeekV4LayerWeights *weights,
+                         float *outputs_hc, const float *branch,
+                         const float *residual_hc, const float *posts,
+                         const float *combs, int hc, int hidden);
 /* MoE router offload: mirrors the bf16 route contract of coli_v4_route_bf16.
  * Uses the resident layer's uploaded f32 gate/bias mirrors through
  * dsv4_cuda_route (which hardcodes 256 experts / top-k 6); any shape or
