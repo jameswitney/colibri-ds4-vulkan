@@ -260,6 +260,15 @@ typedef struct Dsv4CudaKvCache {
 
 typedef struct Dsv4CudaExpertSet {
     int device;
+    /* M5-1c prefill expert bank: per-expert fp4 mirrors (gate/up/down),
+     * uploaded at most once per layer (route-aware refill tops up only the
+     * missing experts; in-place refill reuses the slot on a layer switch).
+     * slots[e][0]=gate, [1]=up, [2]=down — owned by the bank, freed in
+     * dsv4_cuda_expert_set_free. sg/su/sd are the layer's shared-expert fp8
+     * mirrors (engine-owned, rebound per layer via bank_set_shared). */
+    int count, H, I;
+    Dsv4CudaTensor *sg, *su, *sd;
+    Dsv4CudaTensor *slots[256][3];
 } Dsv4CudaExpertSet;
 
 typedef struct Dsv4CudaGraph {
@@ -2017,18 +2026,60 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(
     return NULL;
 }
 
+/* ---- M5-1c: prefill expert bank (batched MoE, COLI_CUDA_MOE_BATCH=1) ----
+ * The engine's coli_v4_gpu_moe_batch_union (deepseek_v4.c:11232) runs a
+ * whole prefill chunk's MoE through the backend: dsv4_cuda_expert_bank_*
+ * manage a per-layer set of routed-expert fp4 mirrors, dsv4_cuda_route_top6_
+ * batch does the chunk's routing, dsv4_cuda_route_moe_ids_batch computes the
+ * routed + shared experts over the chunk. The bank is the point of M5-1c:
+ * each layer's experts are uploaded AT MOST ONCE per layer (the route-aware
+ * refill tops up only the missing ones), so the batched-union phase never
+ * thrashes the decode mirror cache's LRU recycle — the prefill union can
+ * touch ~200 experts per layer while decode's per-token 6 stay hot. The
+ * decode mirror cache and the bank share nothing: separate tensors, separate
+ * VRAM accounting (the engine's reserve already leaves room for the bank
+ * when COLI_CUDA_MOE_BATCH=1, v4_gpu_expert_attach_cached_ex). */
+
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count, int hidden,
                                                 int intermediate, int device,
                                                 Dsv4CudaTensor *shared_gate,
                                                 Dsv4CudaTensor *shared_up,
                                                 Dsv4CudaTensor *shared_down) {
-    (void)count; (void)hidden; (void)intermediate; (void)shared_gate;
-    (void)shared_up; (void)shared_down;
+    if (count < 1 || count > 256 || hidden < 1 || intermediate < 1 ||
+        intermediate % 32 || hidden % 32 || device < 0)
+        return NULL;
+    if (shared_gate || shared_up || shared_down) {
+        /* All three shared mirrors required; fp8 (fmt 8/9 — 9 computes as
+         * 8), geometry = the bank's (gate/up: intermediate x hidden, down:
+         * hidden x intermediate). Matches the CUDA bank_create contract. */
+        if (!shared_gate || !shared_up || !shared_down ||
+            (shared_gate->fmt != 8 && shared_gate->fmt != 9) ||
+            (shared_up->fmt != 8 && shared_up->fmt != 9) ||
+            (shared_down->fmt != 8 && shared_down->fmt != 9) ||
+            shared_gate->O != intermediate || shared_gate->I != hidden ||
+            shared_up->O != intermediate || shared_up->I != hidden ||
+            shared_down->I != intermediate || shared_down->O != hidden)
+            return NULL;
+    }
     Dsv4CudaExpertSet *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->device = device;
+    s->count = count;
+    s->H = hidden;
+    s->I = intermediate;
+    s->sg = shared_gate;
+    s->su = shared_up;
+    s->sd = shared_down;
     return s;
 }
+
+/* Fresh-upload-or-refill of ONE fp4 mirror in a bank slot: the first upload
+ * allocates the fmt=10 tensor (same path as the decode mirror cache's
+ * dsv4_cuda_upload_fp4); a later layer's same slot refills IN PLACE (the
+ * engine resets bank_valid per layer, so every expert of a new layer is
+ * re-uploaded — reallocating would fragment VRAM and slow the refill). */
+static int ds4vk_bank_tensor(Dsv4CudaTensor **slot, const uint8_t *w,
+                             const uint8_t *scale, int O, int I, int device);
 
 int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet *set, int expert,
                                  const uint8_t *gate_weight,
@@ -2039,18 +2090,54 @@ int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet *set, int expert,
                                  const uint8_t *down_scale,
                                  Dsv4CudaTensor **gate, Dsv4CudaTensor **up,
                                  Dsv4CudaTensor **down) {
-    (void)set; (void)expert; (void)gate_weight; (void)gate_scale;
-    (void)up_weight; (void)up_scale; (void)down_weight; (void)down_scale;
+    /* Upload or in-place refill expert's fp4 mirrors into the bank slot.
+     * The engine frees the returned handles immediately after the call (the
+     * CUDA tier returns transient views into the bank's flat storage); the
+     * VK tier returns NULL handles — the bank owns the tensors, and freeing
+     * NULL is a no-op. Return 1 only when all three tensors are resident.
+     * Any failure (fault injection, OOM, geometry) returns 0 and the engine
+     * falls back to the CPU union for the chunk (D6). */
     if (gate) *gate = NULL;
     if (up) *up = NULL;
     if (down) *down = NULL;
-    return 0;
+    if (!set || expert < 0 || expert >= set->count || !gate_weight ||
+        !gate_scale || !up_weight || !up_scale || !down_weight || !down_scale)
+        return 0;
+    int H = set->H, I = set->I;
+    /* gate/up: O=I rows x H cols; down: O=H rows x I cols (rows16 layout). */
+    int ok = ds4vk_bank_tensor(&set->slots[expert][0], gate_weight, gate_scale,
+                               I, H, set->device)
+          && ds4vk_bank_tensor(&set->slots[expert][1], up_weight, up_scale,
+                               I, H, set->device)
+          && ds4vk_bank_tensor(&set->slots[expert][2], down_weight, down_scale,
+                               H, I, set->device);
+    return ok;
+}
+
+/* Definition (see the forward declaration above). */
+static int ds4vk_bank_tensor(Dsv4CudaTensor **slot, const uint8_t *w,
+                             const uint8_t *scale, int O, int I, int device) {
+    if (*slot)
+        return dsv4_cuda_tensor_refill_fp4(*slot, w, scale, O, I, 1);
+    Dsv4CudaTensor *t = NULL;
+    if (!dsv4_cuda_upload_fp4(&t, w, scale, O, I, device)) return 0;
+    *slot = t;
+    return 1;
 }
 
 int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet *set, Dsv4CudaTensor *sg,
                                      Dsv4CudaTensor *su, Dsv4CudaTensor *sd) {
-    (void)set; (void)sg; (void)su; (void)sd;
-    return 0;
+    if (!set) return 0;
+    if (!sg && !su && !sd) { set->sg = set->su = set->sd = NULL; return 1; }
+    if (!sg || !su || !sd || (sg->fmt != 8 && sg->fmt != 9) ||
+        (su->fmt != 8 && su->fmt != 9) || (sd->fmt != 8 && sd->fmt != 9) ||
+        sg->O != set->I || sg->I != set->H || su->O != set->I ||
+        su->I != set->H || sd->I != set->I || sd->O != set->H)
+        return 0;
+    set->sg = sg;
+    set->su = su;
+    set->sd = sd;
+    return 1;
 }
 
 int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet *set, int expert,
@@ -2059,6 +2146,11 @@ int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet *set, int expert,
                                      const uint8_t *dw, const uint8_t *ds,
                                      Dsv4CudaTensor **gate, Dsv4CudaTensor **up,
                                      Dsv4CudaTensor **down) {
+    /* No aux stream on the VK tier (one command queue; the double-buffer
+     * worker would race it). Refuse: the engine's v4_bank2_worker stops
+     * after the first failed aux upload and disables moe-double permanently
+     * ("prefetch produced nothing; single-bank stays") — the CUDA tier's
+     * documented degrade for an unavailable aux API. */
     (void)set; (void)expert; (void)gw; (void)gs; (void)uw; (void)us; (void)dw;
     (void)ds;
     if (gate) *gate = NULL;
@@ -2079,7 +2171,15 @@ int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set, int expert,
     return 0;
 }
 
-void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) { free(set); }
+void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set) {
+    if (!set) return;
+    for (int e = 0; e < set->count && e < 256; e++) {
+        dsv4_cuda_tensor_free(set->slots[e][0]);
+        dsv4_cuda_tensor_free(set->slots[e][1]);
+        dsv4_cuda_tensor_free(set->slots[e][2]);
+    }
+    free(set);
+}
 
 int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set, const int64_t *map,
                                      int vocab, int topk) {
@@ -2110,18 +2210,226 @@ int dsv4_cuda_route_top6_batch(const Dsv4CudaActivation *input,
                                Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,
                                int count, float routed_scale, int *ids,
                                float *weights) {
-    (void)input; (void)gate; (void)bias; (void)count; (void)routed_scale;
-    (void)ids; (void)weights;
-    return 0;
+    /* M5-1c: batch routing for the prefill MoE (COLI_CUDA_MOE_BATCH=1). The
+     * chunk's gate logits are ONE fmt=0 matmul over all tokens (256 x H,
+     * the same f32 gate mirror the decode route uses), then the host top-6
+     * per token (ds4vk_route_top6 — the decode path's strict-greater
+     * selection, ids bit-exact). Returns 1 on success; the engine falls
+     * back to its CPU union on any refusal (D6). */
+    if (!input || !input->data || !gate || !ids || !weights || count < 1 ||
+        count > 128 || !ds4vk_op_enabled(gate))
+        return 0;
+    if (ds4vk_fault_hit(gate)) {
+        ds4vk_fault_log(ds4vk_op_name((Ds4vkOp)gate->op));
+        return 0;
+    }
+    if (gate->fmt != 0 || gate->O != 256 || gate->I < 1 ||
+        (size_t)gate->I > (size_t)input->elements / (size_t)count)
+        return 0;
+    if (bias && (bias->fmt != 0 || bias->O < 256 || bias->I < 1)) return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    float *logits = malloc((size_t)count * 256 * sizeof(*logits));
+    if (!logits) return 0;
+    int ok = coli_vk_matmul(&gate->vk, logits, input->data, NULL, NULL, 0,
+                            count, gate->I, 256, 1);
+    if (ok) {
+        const float *bias_ptr =
+            bias ? (bias->whost_cache
+                       ? bias->whost_cache
+                       : (const float *)coli_vk_tensor_wptr(bias->vk))
+                 : NULL;
+        for (int t = 0; t < count && ok; t++)
+            ok = ds4vk_route_top6(ids + (size_t)t * 6,
+                                  weights + (size_t)t * 6,
+                                  logits + (size_t)t * 256, bias_ptr, NULL,
+                                  6, routed_scale);
+    }
+    free(logits);
+    if (ok) ds4vk_prof_tick(gate, t0);
+    return ok;
 }
 
 int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation *input,
                                   const int *ids, const float *weights,
                                   int count, Dsv4CudaExpertSet *experts,
                                   float limit, Dsv4CudaActivation *output) {
-    (void)input; (void)ids; (void)weights; (void)count; (void)experts;
-    (void)limit; (void)output;
-    return 0;
+    /* M5-1c: the prefill routed+shared MoE over a whole chunk, from the
+     * bank. The routed experts reuse the M5-1b phase machinery PER TOKEN
+     * (phase1 = QDQ(x) + 6 gate/up matmuls, phase2 = QDQ(hid) + 6 down
+     * matmuls — the bitwise host rounding chain between), so the parity
+     * contract is the decode group's (bitwise rounding, thresholded
+     * matmuls). The per-token down outputs are then accumulated in the CPU
+     * union's EXACT order — expert-major (ascending expert id), and within
+     * an expert ascending (item, rank) — so the f32 sum before the engine's
+     * final bf16 round matches v4_moe_batch_union's accumulation. The
+     * shared experts run as batched fp8 matmuls over the chunk (the M3a
+     * decode shared chain; host rounding points bitwise vs
+     * v4_shared_expert_forward_batch_ref), and the combine adds the bf16-
+     * rounded shared output to the routed sum (the CPU union adds shared
+     * last; the engine applies the final bf16 round after this returns). */
+    if (!input || !input->data || !ids || !weights || !experts || !output ||
+        count < 1 || count > 128)
+        return 0;
+    /* Same op gate + L4 fault hook as the decode group (dsv4_cuda_expert_
+     * group): COLI_DSV4_VK_OPS without "expert" refuses the whole bank
+     * batch (the engine then runs its CPU union, D6) and
+     * COLI_DSV4_VK_FAIL=expert forces the failure path. */
+    if (!ds4vk_op_enabled_g_expert()) return 0;
+    if (ds4vk_fault_hit_g(DS4VK_OP_EXPERT)) {
+        ds4vk_fault_log("expert");
+        return 0;
+    }
+    int H = experts->H, I = experts->I;
+    if (H < 1 || I < 1 || experts->count < 1 ||
+        input->elements < (long long)count * H ||
+        output->elements < (long long)count * H)
+        return 0;
+    if (!output->data) {
+        output->data = calloc((size_t)output->elements, sizeof(float));
+        if (!output->data) return 0;
+    }
+    /* The CPU union zeroes its output before accumulating (v4_moe_batch_
+     * union's memset); the CUDA kernels write. Our expert-major and shared
+     * accumulates use +=, so zero first — the engine reuses the same
+     * out_mirror activation across chunks (a stale sum would poison every
+     * chunk after the first). */
+    memset(output->data, 0, (size_t)count * H * sizeof(float));
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    enum { TOPK = 6 };
+    float *gatebuf = malloc((size_t)TOPK * (size_t)I * sizeof(float));
+    float *upbuf = malloc((size_t)TOPK * (size_t)I * sizeof(float));
+    float *hid = malloc((size_t)TOPK * (size_t)I * sizeof(float));
+    float *out = malloc((size_t)TOPK * (size_t)H * sizeof(float));
+    /* per-route bf16(down) outputs, all tokens: the expert-major
+     * accumulation below must re-order them (the CPU union adds expert by
+     * expert, not token by token). count*6*H floats = 12.6 MB @ 128 tok. */
+    float *down_bf16 = malloc((size_t)count * TOPK * (size_t)H * sizeof(float));
+    if (!gatebuf || !upbuf || !hid || !out || !down_bf16) {
+        free(down_bf16); free(out); free(hid); free(upbuf); free(gatebuf);
+        return 0;
+    }
+    int ok = 1;
+    for (int t = 0; t < count && ok; t++) {
+        ColiVkTensor *gv[TOPK], *uv[TOPK], *dv[TOPK];
+        for (int r = 0; r < TOPK; r++) {
+            int e = ids[(size_t)t * TOPK + r];
+            if (e < 0 || e >= experts->count ||
+                !experts->slots[e][0] || !experts->slots[e][1] ||
+                !experts->slots[e][2]) {
+                ok = 0;
+                break;
+            }
+            gv[r] = experts->slots[e][0]->vk;
+            uv[r] = experts->slots[e][1]->vk;
+            dv[r] = experts->slots[e][2]->vk;
+        }
+        if (!ok) break;
+        const float *x = input->data + (size_t)t * H;
+        if (!coli_vk_expert_dsv4_phase1(gv, uv, gatebuf, upbuf, x,
+                                        TOPK, H, I))
+            { ok = 0; break; }
+        /* bitwise host chain (the decode group's): bf16(gate)/bf16(up) ->
+         * limit clamps -> sigmoid -> bf16. No route weight here (applied
+         * inside the per-token weights below — the chain multiplies it). */
+        for (int r = 0; r < TOPK && ok; r++) {
+            const float *g = gatebuf + (size_t)r * I;
+            const float *u = upbuf + (size_t)r * I;
+            float *h = hid + (size_t)r * I;
+            for (int i = 0; i < I; i++) {
+                float gv_ = ds4vk_bf16(g[i]);
+                float uv_ = ds4vk_bf16(u[i]);
+                if (limit > 0.0f) {
+                    gv_ = fminf(gv_, limit);
+                    uv_ = fmaxf(-limit, fminf(uv_, limit));
+                }
+                h[i] = ds4vk_bf16(gv_ * ds4vk_sigmoid(gv_) * uv_ *
+                                   weights[(size_t)t * TOPK + r]);
+            }
+        }
+        if (ok && !coli_vk_expert_dsv4_phase2(dv, out, hid, TOPK, H, I))
+            ok = 0;
+        if (ok)
+            for (int r = 0; r < TOPK; r++) {
+                const float *o = out + (size_t)r * H;
+                float *db = down_bf16 + ((size_t)t * TOPK + r) * H;
+                for (int i = 0; i < H; i++) db[i] = ds4vk_bf16(o[i]);
+            }
+    }
+    if (ok) {
+        /* CPU union accumulation order (v4_moe_batch_union / v4_flush_
+         * expert_batch): expert-major ascending, (item, rank) ascending. */
+        float *y = output->data;
+        for (int e = 0; e < experts->count; e++)
+            for (int t = 0; t < count; t++)
+                for (int r = 0; r < TOPK; r++)
+                    if (ids[(size_t)t * TOPK + r] == e) {
+                        const float *db =
+                            down_bf16 + ((size_t)t * TOPK + r) * H;
+                        float *yt = y + (size_t)t * H;
+                        for (int i = 0; i < H; i++) yt[i] += db[i];
+                    }
+    }
+    /* Shared experts: batched fp8 matmuls over the chunk + the CPU batch
+     * ref's rounding points (bf16(gate), bf16(up), swiglu(limit),
+     * bf16(act), down, bf16(out)) — same chain as the M3a decode shared
+     * matvecs, just S=count. The shared output is bf16-rounded and added
+     * to the routed sum (the CPU union adds shared last). */
+    if (ok) {
+        Dsv4CudaTensor *sg = experts->sg, *su = experts->su, *sd = experts->sd;
+        if (!sg || !su || !sd) ok = 0;
+        if (ok) {
+            size_t cells = (size_t)count * (size_t)I;
+            Dsv4CudaActivation g_act = {.device = experts->device,
+                                        .elements = (long long)cells};
+            Dsv4CudaActivation u_act = {.device = experts->device,
+                                        .elements = (long long)cells};
+            Dsv4CudaActivation a_act = {.device = experts->device,
+                                        .elements = (long long)cells};
+            Dsv4CudaActivation s_act = {.device = experts->device,
+                                        .elements = (long long)count * H};
+            /* a_act is the host-side intermediate (bf16/swiglu between the
+             * gate/up and down matmuls) — its data is the scratch the sd
+             * matmul reads, so allocate it here (the matmul entries only
+             * allocate their OUTPUT buffers). */
+            a_act.data = calloc(cells, sizeof(float));
+            if (!a_act.data) ok = 0;
+            else if (!dsv4_cuda_matmul_batch(sg, input, count, &g_act) ||
+                     !dsv4_cuda_matmul_batch(su, input, count, &u_act))
+                ok = 0;
+            else {
+                for (size_t i = 0; i < cells; i++) {
+                    float gv = ds4vk_bf16(g_act.data[i]);
+                    float uv = ds4vk_bf16(u_act.data[i]);
+                    if (limit > 0.0f) {
+                        gv = fminf(gv, limit);
+                        uv = fmaxf(-limit, fminf(uv, limit));
+                    }
+                    a_act.data[i] = ds4vk_bf16(gv * ds4vk_sigmoid(gv) * uv);
+                }
+                if (!dsv4_cuda_matmul_batch(sd, &a_act, count, &s_act))
+                    ok = 0;
+                else {
+                    float *y = output->data;
+                    for (int i = 0; i < count * H; i++)
+                        y[i] += ds4vk_bf16(s_act.data[i]);
+                }
+            }
+            free(g_act.data); free(u_act.data); free(a_act.data);
+            free(s_act.data);
+        }
+    }
+    free(down_bf16); free(out); free(hid); free(upbuf); free(gatebuf);
+    if (ok) {
+        /* VK_PROF under op=expert: tick on the first uploaded bank slot
+         * (slot 0 may never be routed, so scan for a live handle). */
+        Dsv4CudaTensor *tick_t = NULL;
+        for (int e = 0; e < experts->count && !tick_t; e++)
+            tick_t = experts->slots[e][0];
+        if (tick_t) ds4vk_prof_tick(tick_t, t0);
+    }
+    return ok;
 }
 
 int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation *input,

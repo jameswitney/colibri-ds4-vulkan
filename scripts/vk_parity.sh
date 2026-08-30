@@ -23,7 +23,14 @@
 #   VK_ARCH            -march for the build (default: native)
 #   VK_PROMPT          validation prompt for the real A/B (default: "The
 #                      capital of France is")
-#   VK_MAX_TOKENS      greedy tokens for the real A/B (default: 8)
+#   VK_MAX_TOKENS      greedy tokens for the real A/B (default: 16; the default
+#                      prompt EOSes at 9 tokens — see VK_LONG_PROMPT for a real
+#                      long-generation parity check)
+#   VK_LONG_PROMPT     long-generation prompt for the parity-envelope check
+#                      (REVIEW G12 / M5-perf-2): set to the photosynthesis prompt
+#                      with VK_MAX_TOKENS=20 (the tier is byte-identical to 20
+#                      tokens there; 21+ can flip a borderline token — the
+#                      thresholded-tier envelope, not a bug)
 #   VK_MEMORY_GB       --memory-gb for the real A/B (default: 12)
 #
 # Exit: 0 = all gates green; non-zero = first failing gate (set -e).
@@ -35,7 +42,7 @@ C="$ROOT/c"
 MODEL="${MODEL:-${1:-}}"
 VK_ARCH="${VK_ARCH:-native}"
 VK_PROMPT="${VK_PROMPT:-The capital of France is}"
-VK_MAX_TOKENS="${VK_MAX_TOKENS:-8}"
+VK_MAX_TOKENS="${VK_MAX_TOKENS:-16}"
 VK_MEMORY_GB="${VK_MEMORY_GB:-12}"
 REBUILD=0
 PER_OP_AB=0

@@ -149,3 +149,7 @@ c/tests/.vk_dqdq_oracle.o
 # M3a L2 per-op oracle objects + the tiny fixture's usage file
 c/tests/.vk_ops_oracle_*.o
 c/deepseek_v4_tiny/.coli_usage
+
+# M5 long/complex-prompt A/B artifacts (vk_longgen_ab.py output)
+.vk_longgen/
+.vk_longgen_run.log

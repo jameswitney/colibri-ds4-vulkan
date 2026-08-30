@@ -43,6 +43,41 @@ extern void coli_bf16_round_array(float *values, size_t count);
 extern int coli_v4_swiglu(float *output, const float *gate, const float *up,
                           int dimension, float limit);
 extern float coli_bf16_round(float value);
+/* M5-1c: the shared-expert fp8 matvec + the engine's route (oracle units
+ * NATIVE_QUANT / ROUTE_BF16 — the ops suite's own externs). */
+extern int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
+                               const float *input);
+extern int coli_v4_route_bf16(float *weights, int *indices,
+                              const float *hidden, const uint16_t *gate,
+                              const float *bias, const int *forced_indices,
+                              int experts, int dimension, int topk,
+                              float route_scale);
+
+/* e4m3 weight bytes must avoid the NaN codes 0x7f/0xff (the M2-4 discipline
+ * — the fp8 suite's nn_byte, shared weights for the bank test). */
+static uint8_t nn_byte(void) {
+    uint8_t c = (uint8_t)rand();
+    return (c & 0x7f) == 0x7f ? (uint8_t)(c & 0x7e) : c;
+}
+
+/* f32 -> bf16 (round-to-nearest-even) — the ops suite's helper, for the
+ * route gate's bf16 storage bytes. */
+static uint16_t f32_to_bf16(float value) {
+    uint32_t bits; memcpy(&bits, &value, 4);
+    uint32_t rounded = (bits + 0x7fffu + ((bits >> 16) & 1)) >> 16;
+    return (uint16_t)rounded;
+}
+
+/* bf16 -> f32 (exact). The engine's gate mirror is the resident bf16 gate
+ * decoded to f32 (v4_gpu_upload_gate), so the test builds the GPU mirror the
+ * same way: identical weight VALUES on both sides, only the reduction order
+ * differs (the ops suite's bf16-rounded-vs-raw draw can flip a borderline
+ * top-6 at 4096 terms; identical values cannot). */
+static float bf16_to_f32(uint16_t b) {
+    uint32_t bits = (uint32_t)b << 16;
+    float f; memcpy(&f, &bits, 4);
+    return f;
+}
 
 /* sigmoidf_stable twin (deepseek_v4.c) — the engine's swiglu sigmoid. */
 static float sigmoid_stable(float value) {
@@ -454,6 +489,304 @@ static int run_fused_phases(int hidden, int input, int experts, int topk,
     return bad;
 }
 
+/* ---- M5-1c: batch routing (dsv4_cuda_route_top6_batch) vs the engine's
+ * coli_v4_route_bf16 per token. The batched fmt=0 gate matvec (S=tokens,
+ * the mHC-batch pattern) over the same f32 gate mirror the decode route
+ * builds (bf16 storage -> exact f32 decode); ids must match EXACTLY
+ * (strict-greater top-6), weights within the ops suite's fp32-reduction
+ * bar (2e-3 relative). */
+static int run_route_batch(int experts, int hidden, int tokens) {
+    if (experts > 256 || tokens > 128) return 1;
+    float *gate = malloc((size_t)experts * hidden * 4);
+    uint16_t *gate_bf16 = malloc((size_t)experts * hidden * 2);
+    float *bias = malloc((size_t)experts * 4);
+    float *x = malloc((size_t)tokens * hidden * 4);
+    if (!gate || !gate_bf16 || !bias || !x) {
+        free(x); free(bias); free(gate_bf16); free(gate); return 1;
+    }
+    for (int i = 0; i < experts * hidden; i++) {
+        float raw = (float)(rand() % 200001 - 100000) / 100000.0f;
+        gate_bf16[i] = f32_to_bf16(raw);
+        gate[i] = bf16_to_f32(gate_bf16[i]);   /* the engine's gate mirror */
+    }
+    for (int i = 0; i < experts; i++)
+        bias[i] = (float)(rand() % 2001 - 1000) / 1000.0f;
+    for (int i = 0; i < tokens * hidden; i++)
+        x[i] = (float)(rand() % 200001 - 100000) / 100.0f;
+    float w_c[128][6]; int id_c[128][6];
+    int okc = 1;
+    for (int t = 0; t < tokens; t++)
+        okc &= coli_v4_route_bf16(w_c[t], id_c[t], x + (size_t)t * hidden,
+                                  gate_bf16, bias, NULL, experts, hidden,
+                                  6, 1.25f) == 0;
+    Dsv4CudaTensor *tg = NULL, *tb = NULL;
+    int okg = dsv4_cuda_upload_f32(&tg, gate, experts, hidden, 0) &&
+              dsv4_cuda_upload_f32(&tb, bias, experts, 1, 0);
+    if (!okg) { fprintf(stderr, "vk-experts: route_batch upload refused\n"); okg = 0; }
+    ds4vk_tensor_set_op(tg, "route");
+    ds4vk_tensor_set_op(tb, "route");
+    Dsv4CudaActivation *in =
+        dsv4_cuda_activation_create(0, (long long)tokens * hidden);
+    if (okg && !dsv4_cuda_activation_upload(in, x, (long long)tokens * hidden))
+        okg = 0;
+    int ids[128][6]; float wts[128][6];
+    if (okg && !dsv4_cuda_route_top6_batch(in, tg, tb, tokens, 1.25f,
+                                           &ids[0][0], &wts[0][0])) {
+        fprintf(stderr, "vk-experts: route_top6_batch refused\n");
+        okg = 0;
+    }
+    int ids_ok = 1, w_ok = 1;
+    for (int t = 0; t < tokens; t++)
+        for (int k = 0; k < 6; k++) {
+            if (ids[t][k] != id_c[t][k]) ids_ok = 0;
+            if (fabsf(wts[t][k] - w_c[t][k]) > 2e-3f *
+                    fmaxf(1.0f, fabsf(w_c[t][k])))
+                w_ok = 0;
+        }
+    printf("vk-experts route_batch (experts=%d hidden=%d tokens=%d): ids %s "
+           "weights %s\n", experts, hidden, tokens,
+           ids_ok ? "MATCH" : "DIFFER", w_ok ? "OK" : "FAIL");
+    dsv4_cuda_activation_free(in);
+    dsv4_cuda_tensor_free(tb); dsv4_cuda_tensor_free(tg);
+    free(x); free(bias); free(gate_bf16); free(gate);
+    return okc && okg && ids_ok && w_ok ? 0 : 1;
+}
+
+/* CPU union reference for the bank batch (v4_moe_batch_union's pre-round
+ * state): per-route bf16 contributions accumulated EXPERT-MAJOR (ascending
+ * expert id, then (item, rank) ascending — the exact order of
+ * v4_apply_expert_batch's flushes), then the shared fp8 batch chain
+ * (bf16(gate)/bf16(up)/swiglu/bf16(act)/down/bf16(out) — the rounding points
+ * of v4_shared_expert_forward_batch_ref) added last. yc is the f32 sum the
+ * engine bf16-rounds after the backend returns. contrib is scratch
+ * (tokens*6*H floats). */
+static int bank_cpu_ref(float *yc, const float *x, const int *ids,
+                        const float *wgt, int tokens, int experts_n,
+                        const ColiTensorView *vg, const ColiTensorView *vu,
+                        const ColiTensorView *vd, const ColiTensorView *w1v,
+                        const ColiTensorView *w3v, const ColiTensorView *w2v,
+                        int H, int I, float limit, float *contrib) {
+    memset(yc, 0, (size_t)tokens * H * 4);
+    for (int t = 0; t < tokens; t++)
+        for (int r = 0; r < 6; r++) {
+            int e = ids[t * 6 + r];
+            if (ref_expert_forward(contrib + ((size_t)t * 6 + r) * H,
+                                   &vg[e], &vu[e], &vd[e],
+                                   x + (size_t)t * H, wgt[t * 6 + r], limit))
+                return -1;
+        }
+    for (int e = 0; e < experts_n; e++)
+        for (int t = 0; t < tokens; t++)
+            for (int r = 0; r < 6; r++)
+                if (ids[t * 6 + r] == e) {
+                    const float *out =
+                        contrib + ((size_t)t * 6 + r) * H;
+                    float *yt = yc + (size_t)t * H;
+                    for (int i = 0; i < H; i++) yt[i] += out[i];
+                }
+    size_t cells = (size_t)tokens * (size_t)I;
+    float *g = malloc(cells * 4), *u = malloc(cells * 4);
+    float *act = malloc(cells * 4), *s = malloc((size_t)tokens * H * 4);
+    if (!g || !u || !act || !s) { free(s); free(act); free(u); free(g); return -1; }
+    for (int t = 0; t < tokens; t++)
+        if (coli_fp8_matvec_ref(g + (size_t)t * I, w1v, x + (size_t)t * H) ||
+            coli_fp8_matvec_ref(u + (size_t)t * I, w3v, x + (size_t)t * H)) {
+            free(s); free(act); free(u); free(g); return -1;
+        }
+    coli_bf16_round_array(g, cells);
+    coli_bf16_round_array(u, cells);
+    for (int t = 0; t < tokens; t++)
+        if (coli_v4_swiglu(act + (size_t)t * I, g + (size_t)t * I,
+                           u + (size_t)t * I, I, limit)) {
+            free(s); free(act); free(u); free(g); return -1;
+        }
+    coli_bf16_round_array(act, cells);
+    for (int t = 0; t < tokens; t++)
+        if (coli_fp8_matvec_ref(s + (size_t)t * H, w2v,
+                                act + (size_t)t * I)) {
+            free(s); free(act); free(u); free(g); return -1;
+        }
+    coli_bf16_round_array(s, (size_t)tokens * H);
+    for (int i = 0; i < tokens * H; i++) yc[i] += s[i];
+    free(s); free(act); free(u); free(g);
+    return 0;
+}
+
+/* ---- M5-1c: the prefill expert bank (COLI_CUDA_MOE_BATCH=1) ----
+ * Drives dsv4_cuda_expert_bank_create/upload + dsv4_cuda_route_moe_ids_batch
+ * DIRECTLY over a small batch with fixed ids/weights vs the CPU union
+ * reference above (bank_cpu_ref). The backend returns the pre-round f32
+ * routed+shared sum (the engine bf16-rounds after), so the compare is
+ * thresholded like the decode group. Also pins the in-place refill
+ * (layer-switch pattern): a second upload pass over the SAME slots with new
+ * bytes must match a reference built from the NEW bytes. */
+static int run_bank_batch(int hidden, int input, int experts_n, int tokens,
+                          float limit, int verbose) {
+    int H = input, I = hidden;   /* gate/up: I x H, down: H x I (rows16) */
+    if (experts_n < 6) experts_n = 6;
+    if (experts_n > 16) experts_n = 16;
+    if (tokens < 1 || tokens > 128) tokens = 4;
+    uint8_t *wg[16], *scg[16], *wu[16], *scu[16], *wd[16], *scd[16];
+    uint8_t *wg2[16], *scg2[16], *wu2[16], *scu2[16], *wd2[16], *scd2[16];
+    ColiTensorView vg[16], vu[16], vd[16], vg2[16], vu2[16], vd2[16];
+    memset(vg, 0, sizeof(vg)); memset(vu, 0, sizeof(vu)); memset(vd, 0, sizeof(vd));
+    memset(vg2, 0, sizeof(vg2)); memset(vu2, 0, sizeof(vu2)); memset(vd2, 0, sizeof(vd2));
+    float *x = malloc((size_t)tokens * H * 4);
+    float *yc = calloc((size_t)tokens * H, 4);
+    float *yc2 = calloc((size_t)tokens * H, 4);
+    float *wgt = malloc((size_t)tokens * 6 * 4);
+    int *ids = malloc((size_t)tokens * 6 * sizeof(int));
+    float *contrib = malloc((size_t)tokens * 6 * H * 4);
+    if (!x || !yc || !yc2 || !wgt || !ids || !contrib) {
+        free(contrib); free(ids); free(wgt); free(yc2); free(yc); free(x);
+        return 1;
+    }
+    int bad = 0;
+    for (int i = 0; i < tokens * H; i++)
+        x[i] = (float)(rand() % 200001 - 100000) / 100.0f;
+    for (int t = 0; t < tokens; t++)
+        for (int r = 0; r < 6; r++) {
+            /* distinct within a token (gcd(3,16)=1); repeats across tokens */
+            ids[t * 6 + r] = (t * 2 + r * 3 + 1) % experts_n;
+            wgt[t * 6 + r] = (float)(rand() % 2000) / 1000.0f + 0.05f;
+        }
+    for (int e = 0; e < experts_n; e++) {
+        if (alloc_fp4(&wg[e], &scg[e], I, H) ||
+            alloc_fp4(&wu[e], &scu[e], I, H) ||
+            alloc_fp4(&wd[e], &scd[e], H, I) ||
+            alloc_fp4(&wg2[e], &scg2[e], I, H) ||
+            alloc_fp4(&wu2[e], &scu2[e], I, H) ||
+            alloc_fp4(&wd2[e], &scd2[e], H, I)) { bad = 1; break; }
+        fill_fp4_view(&vg[e], wg[e], scg[e], I, H);
+        fill_fp4_view(&vu[e], wu[e], scu[e], I, H);
+        fill_fp4_view(&vd[e], wd[e], scd[e], H, I);
+        fill_fp4_view(&vg2[e], wg2[e], scg2[e], I, H);
+        fill_fp4_view(&vu2[e], wu2[e], scu2[e], I, H);
+        fill_fp4_view(&vd2[e], wd2[e], scd2[e], H, I);
+    }
+    /* shared experts (fp8): w1/w3 = gate/up I x H, w2 = down H x I; raw
+     * e4m3 bytes + E8M0 128x128-block codes (bscale = the expanded fp32 the
+     * CPU reference decodes to). */
+    size_t nsc1 = (size_t)((I + 127) / 128) * ((H + 127) / 128);
+    size_t nsc2 = (size_t)((H + 127) / 128) * ((I + 127) / 128);
+    uint8_t *w1 = malloc((size_t)I * H), *e8_1 = malloc(nsc1);
+    uint8_t *w3 = malloc((size_t)I * H), *e8_3 = malloc(nsc1);
+    uint8_t *w2 = malloc((size_t)H * I), *e8_2 = malloc(nsc2);
+    float *b1 = malloc(nsc1 * 4), *b3 = malloc(nsc1 * 4), *b2 = malloc(nsc2 * 4);
+    if (!w1 || !e8_1 || !w3 || !e8_3 || !w2 || !e8_2 || !b1 || !b3 || !b2)
+        bad = 1;
+    for (size_t i = 0; !bad && i < (size_t)I * H; i++) {
+        w1[i] = nn_byte(); w3[i] = nn_byte();
+    }
+    for (size_t i = 0; !bad && i < (size_t)H * I; i++) w2[i] = nn_byte();
+    for (size_t i = 0; !bad && i < nsc1; i++) {
+        uint8_t c = (uint8_t)(115 + rand() % 14);
+        e8_1[i] = c; b1[i] = ref_ue8m0(c);
+        c = (uint8_t)(115 + rand() % 14);
+        e8_3[i] = c; b3[i] = ref_ue8m0(c);
+    }
+    for (size_t i = 0; !bad && i < nsc2; i++) {
+        uint8_t c = (uint8_t)(115 + rand() % 14);
+        e8_2[i] = c; b2[i] = ref_ue8m0(c);
+    }
+    ColiTensorView w1v = {0}, w3v = {0}, w2v = {0};
+    w1v.format = COLI_TENSOR_FP8_E4M3_BLOCK; w1v.scale_format = COLI_SCALE_F32;
+    w1v.data = w1; w1v.scales = b1; w1v.data_bytes = (size_t)I * H;
+    w1v.scale_bytes = nsc1 * 4; w1v.rows = I; w1v.columns = H;
+    w1v.block_rows = 128; w1v.block_columns = 128;
+    w3v = w1v; w3v.data = w3; w3v.scales = b3;
+    w2v.format = COLI_TENSOR_FP8_E4M3_BLOCK; w2v.scale_format = COLI_SCALE_F32;
+    w2v.data = w2; w2v.scales = b2; w2v.data_bytes = (size_t)H * I;
+    w2v.scale_bytes = nsc2 * 4; w2v.rows = H; w2v.columns = I;
+    w2v.block_rows = 128; w2v.block_columns = 128;
+    if (!bad && bank_cpu_ref(yc, x, ids, wgt, tokens, experts_n, vg, vu, vd,
+                             &w1v, &w3v, &w2v, H, I, limit, contrib))
+        bad = 1;
+    /* GPU side: bank + shared mirrors (the engine tags the shared mirrors
+     * "shared" at upload — untagged tensors are gated off by default) */
+    Dsv4CudaTensor *sg = NULL, *su = NULL, *sd = NULL;
+    int okg = !bad && dsv4_cuda_upload_fp8(&sg, w1, e8_1, I, H, 0) &&
+              dsv4_cuda_upload_fp8(&su, w3, e8_3, I, H, 0) &&
+              dsv4_cuda_upload_fp8(&sd, w2, e8_2, H, I, 0);
+    if (okg) {
+        ds4vk_tensor_set_op(sg, "shared");
+        ds4vk_tensor_set_op(su, "shared");
+        ds4vk_tensor_set_op(sd, "shared");
+    }
+    Dsv4CudaExpertSet *bank =
+        okg ? dsv4_cuda_expert_bank_create(experts_n, H, I, 0, sg, su, sd)
+            : NULL;
+    if (bank) {
+        for (int e = 0; e < experts_n && okg; e++) {
+            Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
+            if (!dsv4_cuda_expert_bank_upload(bank, e, wg[e], scg[e],
+                                              wu[e], scu[e], wd[e], scd[e],
+                                              &bg, &bu, &bd) ||
+                bg || bu || bd)   /* bank owns the tensors: handles must be NULL */
+                okg = 0;
+        }
+    }
+    Dsv4CudaActivation *in =
+        dsv4_cuda_activation_create(0, (long long)tokens * H);
+    Dsv4CudaActivation *out =
+        dsv4_cuda_activation_create(0, (long long)tokens * H);
+    if (okg && !dsv4_cuda_activation_upload(in, x, (long long)tokens * H))
+        okg = 0;
+    int okb = okg && dsv4_cuda_route_moe_ids_batch(
+                          in, ids, wgt, tokens, bank, limit, out);
+    if (okg && !okb)
+        fprintf(stderr, "vk-experts: route_moe_ids_batch refused "
+                        "(H=%d I=%d experts=%d tokens=%d)\n",
+                H, I, experts_n, tokens);
+    float *yg = malloc((size_t)tokens * H * 4);
+    if (okb && !yg) { bad = 1; okb = 0; }
+    if (okb && !dsv4_cuda_activation_download(yg, out, (long long)tokens * H))
+        okb = 0;
+    if (okb)
+        bad |= check_stats("bank batch", tokens * H, yg, yc, verbose);
+    /* in-place refill pass: same slots, new bytes (the layer-switch pattern) */
+    if (bank && !bad) {
+        int refill_ok = 1;
+        for (int e = 0; e < experts_n && refill_ok; e++) {
+            Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
+            if (!dsv4_cuda_expert_bank_upload(bank, e, wg2[e], scg2[e],
+                                              wu2[e], scu2[e], wd2[e], scd2[e],
+                                              &bg, &bu, &bd))
+                refill_ok = 0;
+        }
+        if (!refill_ok)
+            fprintf(stderr, "vk-experts: bank refill upload failed\n");
+        else if (bank_cpu_ref(yc2, x, ids, wgt, tokens, experts_n,
+                              vg2, vu2, vd2, &w1v, &w3v, &w2v,
+                              H, I, limit, contrib))
+            bad = 1;
+        else if (!dsv4_cuda_route_moe_ids_batch(in, ids, wgt, tokens, bank,
+                                                limit, out)) {
+            fprintf(stderr, "vk-experts: route_moe_ids_batch refused after "
+                            "refill\n");
+            bad = 1;
+        } else if (!dsv4_cuda_activation_download(yg, out,
+                                                  (long long)tokens * H))
+            bad = 1;
+        else
+            bad |= check_stats("bank refill", tokens * H, yg, yc2, verbose);
+    }
+    dsv4_cuda_expert_set_free(bank);
+    dsv4_cuda_tensor_free(sd); dsv4_cuda_tensor_free(su); dsv4_cuda_tensor_free(sg);
+    dsv4_cuda_activation_free(in); dsv4_cuda_activation_free(out);
+    free(yg);
+    for (int e = 0; e < experts_n; e++) {
+        free(scd2[e]); free(wd2[e]); free(scu2[e]); free(wu2[e]);
+        free(scg2[e]); free(wg2[e]);
+        free(scd[e]); free(wd[e]); free(scu[e]); free(wu[e]);
+        free(scg[e]); free(wg[e]);
+    }
+    free(contrib); free(ids); free(wgt); free(yc2); free(yc); free(x);
+    free(b2); free(b3); free(b1); free(e8_2); free(w2); free(e8_3); free(w3);
+    free(e8_1); free(w1);
+    return bad;
+}
+
 /* Env-sensitive scenarios (op gating, fault injection) must run in forked
  * children: the backend's COLI_DSV4_VK_OPS / COLI_DSV4_VK_FAIL masks are
  * process-static caches parsed at first use, so an env change mid-process
@@ -562,10 +895,22 @@ int main(void) {
     bad |= run_fp4_matvec_edge(2048, 4096, 1);
     bad |= run_expert_group(2048, 4096, 6, 6, 15.0f, 1);
     bad |= run_fused_phases(2048, 4096, 6, 6, 15.0f, 1);
+    /* M5-1c prefill bank: batch routing + batched MoE over the bank (real
+     * DeepSeek-V4-Flash-0731 routed-expert shapes: gate/up 2048x4096,
+     * down 4096x2048, top-6, swiglu_limit from the config) */
+    bad |= run_route_batch(256, 4096, 4);
+    bad |= run_route_batch(256, 4096, 128);
+    bad |= run_bank_batch(2048, 4096, 12, 4, 15.0f, 1);
     /* tiny fixture shapes (4 experts, top-2, intermediate 128) */
     bad |= run_fp4_matvec(128, 128, 1);
     bad |= run_expert_group(128, 128, 4, 2, 15.0f, 1);
     bad |= run_fused_phases(128, 128, 4, 2, 15.0f, 1);
+    bad |= run_route_batch(256, 128, 4);
+    bad |= run_bank_batch(128, 128, 8, 4, 15.0f, 1);
+    /* M5-1c batch-128 stress: the real prefill chunks run up to 128 tokens
+     * per layer-chunk (the engine's union gate), so the bank's batched MoE
+     * must hold at the full chunk width, not just the small batches above. */
+    bad |= run_bank_batch(128, 128, 8, 128, 15.0f, 1);
 
     if (bad) { fprintf(stderr, "vk-experts: FAIL\n"); coli_vk_shutdown(); return 1; }
     printf("vk-experts: OK\n");

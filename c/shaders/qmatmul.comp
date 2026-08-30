@@ -110,6 +110,16 @@ void main() {
     for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
         uint rowBase = uint(p.woff) + uint(o) * uint(p.rowWords);
         float sum = 0.0;
+        /* M5-perf-1: the dsv4 block-scale paths (fmt 8/10) accumulate the
+         * scaled partials in fp64 per lane + a final fp64 subgroupAdd — the
+         * CPU reference (quant.h matmul_fp8) sums fp32 within each 128-block
+         * then fp64 ACROSS blocks, while the old fp32 cross-block tree
+         * drifted ~1e-6 relative (a borderline greedy token flipped at
+         * generation 18 on the real checkpoint). The within-block fp32 word
+         * partials are unchanged, so the fp4/fp8 matvec contracts (global
+         * ~1e-7..1e-6) tighten to the block-internal rounding class. GLSL
+         * converts the float products to double exactly. */
+        double dsum = 0.0;
         if (p.fmt == 1) {
             int words = (p.I + 3) / 4;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -170,13 +180,13 @@ void main() {
                 float a = 0.0;
                 for (int k = 0; k < 4; k++) { int i = i0 + k;
                     if (i < p.I) a += xsh[i] * e4m3(pk, k); }
-                sum += a * scale[sb + uint(i0 / 128)];
+                dsum += double(a * scale[sb + uint(i0 / 128)]);
             } else for (int wi = lane; wi < words; wi += sgsize) {
                 uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
                 float a = 0.0;
                 for (int k = 0; k < 4; k++) { int i = i0 + k;
                     if (i < p.I) a += x[xoff + i] * e4m3(pk, k); }
-                sum += a * scale[sb + uint(i0 / 128)];
+                dsum += double(a * scale[sb + uint(i0 / 128)]);
             }
         } else if (p.fmt == 4 || p.fmt == 7) { // grouped int4 (#298 semantics) or MXFP4:
             // nibble decode, one scale per gs inputs — gs % 8 == 0 (host-gated), so a
@@ -221,7 +231,22 @@ void main() {
                 for (int k = 0; k < 8; k++) { int i = i0 + k; if (i < p.I) sum += x[xoff + i] * i4(pk, k); }
             }
         }
-        float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 8 || p.fmt == 10 || p.fmt == 0 || p.fmt == 16) ? tot : tot * scale[o];
+        /* M5-perf-1: fmt=8 reduces in fp64 — the CPU reference (quant.h
+         * matmul_fp8) sums fp32 within each 128-block then fp64 ACROSS
+         * blocks, while the old fp32 cross-block tree drifted enough to flip
+         * a borderline greedy token at generation 18 on the real checkpoint.
+         * fmt=10 (fp4 experts) stays fp32: the engine's rows16 kernel is an
+         * fp32 SIMD accumulate (native_quant_fp4_rows16), so fp64 there would
+         * diverge from the CPU AND pay RDNA2's 1/16 fp64 rate. subgroupAdd on
+         * double is covered by GL_KHR_shader_subgroup_arithmetic when the
+         * implementation advertises float64 (RADV gfx10+ does); hosts without
+         * it fail the pipeline build and degrade to CPU (D6). */
+        if (p.fmt == 8) {
+            double tot = subgroupAdd(dsum);
+            if (lane == 0) y[s * p.O + o] = float(tot);
+        } else {
+            float tot = subgroupAdd(sum);
+            if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 0 || p.fmt == 16) ? tot : tot * scale[o];
+        }
     }
 }
