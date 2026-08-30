@@ -90,6 +90,7 @@ typedef enum {
     DS4VK_OP_ATTN,
     DS4VK_OP_MHC,
     DS4VK_OP_COMP,
+    DS4VK_OP_EXPERT,   /* M5-1a: routed-expert fp4 group (mirrors + group) */
     DS4VK_OP_COUNT
 } Ds4vkOp;
 
@@ -103,6 +104,7 @@ static const char *ds4vk_op_name(Ds4vkOp op) {
     case DS4VK_OP_ATTN: return "attn";
     case DS4VK_OP_MHC: return "mhc";
     case DS4VK_OP_COMP: return "comp";
+    case DS4VK_OP_EXPERT: return "expert";
     default: return "none";
     }
 }
@@ -168,6 +170,14 @@ static int ds4vk_op_enabled_g_mhc(void) {
     int mask = ds4vk_op_mask();
     if (mask < 0) return 1;
     return (mask >> DS4VK_OP_MHC) & 1;
+}
+
+/* The routed-expert group (M5-1a) runs over the mirror handles directly
+ * (no single tensor to tag) — gate its group like attention/mHC. */
+static int ds4vk_op_enabled_g_expert(void) {
+    int mask = ds4vk_op_mask();
+    if (mask < 0) return 1;
+    return (mask >> DS4VK_OP_EXPERT) & 1;
 }
 
 /* ---- L4 fault injection (TEST.md §4, M3d-1) ----
@@ -262,6 +272,8 @@ static const char *stub_fmt_name(int fmt) {
     case 8:  return "fp8-e4m3";
     case 9:  return "fp8-bf16";
     case 4:  return "fp4";
+    case 7:  return "fp4-mxfp4";   /* GLM mxfp4 (per-group scale) */
+    case 10: return "fp4-elem";     /* M5-1a: dsv4 fp4, per-element scale */
     case 16: return "bf16";
     case 32: return "f32";
     default: return "?";
@@ -410,8 +422,14 @@ long long dsv4_cuda_mem_free_mb(int device) {
     (void)device;
     double used = 0, budget = 0;
     if (coli_vk_mem_budget(&used, &budget) && budget > 0) {
-        double free_mb = budget - used;
-        return free_mb > 0 ? (long long)(free_mb / 1e6) : 0;
+        /* coli_vk_mem_budget reports GB (heapUsage/1e9); convert to MiB. A
+         * bytes/GB mixup here reported ~0 MB free and made the expert mirror
+         * cache's VRAM growth guard (v4_gpu_expert_attach_cached, reserve 600
+         * MB) recycle ONE slot for every expert — all routed mirrors shared a
+         * single tensor (M5-1a parity run: every expert produced the same
+         * gate/up/down result). */
+        double free_gb = budget - used;
+        return free_gb > 0 ? (long long)(free_gb * 1024.0) : 0;
     }
     return 16128; /* RX 6900 XT VRAM; VK_EXT_memory_budget absent */
 }
@@ -470,14 +488,95 @@ int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t, const uint8_t *w,
     return 1;
 }
 
+/* ---- M5-1a: fp4 expert tier (routed experts, decode path) ----
+ * The dsv4 routed-expert format (COLI_TENSOR_FP4_NATIVE_BLOCK +
+ * COLI_SCALE_UE8M0, deepseek_v4.c coli_fp4_matvec_ref): e2m1 nibbles packed
+ * 2/byte (LOW nibble = even column, bit3 = sign, bits 0..2 index
+ * {0,.5,1,1.5,2,3,4,6}) + one UE8M0 byte per 32-input group. That is exactly
+ * the mxfp4 (fmt=7) layout the shared qmatmul.comp already decodes (mx4() +
+ * per-gs scale, PLAN: GLM's Kimi K3 tier ships the same format), so the fp4
+ * tier needs NO shader change — the upload expands UE8M0 -> f32 (the shader
+ * is float-only) and stores a fmt=7 tensor with gs=32, mirroring the fp8
+ * tier's E8M0 expansion (D4). The matvec chain replicates coli_fp4_matvec_ref:
+ * activation QDQ (block=128) + fmt=7 matmul on the dequantized activations. */
+
+/* UE8M0 scale: replicate the engine's e8 TABLE semantics exactly (the CPU
+ * fp4 reference — coli_fp4_matvec_rows16_order / rows16_v10 — decodes via
+ * coli_e8m0_table: 0xff -> NaN, else 2^(value-127)). NOT the quant.h
+ * mx4_scale bit trick (0 -> +0, 255 -> +inf): the real checkpoint's expert
+ * gate scales carry codes 0 and 255, and the swiglu fminf/fmaxf clamps
+ * REPAIR the NaN rows (fminf(NaN, limit)=limit) while +inf survives into
+ * -inf -> NaN poison. This divergence was found on the real checkpoint
+ * (M5-1a, first parity run); the L2 suite now pins the 0/255 codes. */
+static float ds4vk_ue8m0(uint8_t s) {
+    if (s == 0xff) return NAN;
+    return ldexpf(1.0f, (int)s - 127);
+}
+
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                          const uint8_t *scale, int O, int I, int device) {
-    /* Deliberately fails: fp4 expert mirrors are the M5 expert tier. Keeping
-     * them NULL keeps the hybrid MoE block unreachable (its failure path is
-     * token-fatal, not a D6 fallback) and the run pure-CPU on experts. */
-    (void)w; (void)scale; (void)O; (void)I; (void)device;
-    if (t) *t = NULL;
-    return 0;
+    /* Real fp4 upload (M5-1a): packed e2m1 nibbles (I/2 bytes/row) + UE8M0
+     * per-32-group scales expanded to f32 at upload, fmt=10 gs=32. fmt=10 is
+     * the per-ELEMENT scale shader branch (M5-1a parity fix) — the engine's
+     * rows16 kernel multiplies the group scale per element, which is
+     * load-bearing for the extreme UE8M0 codes (0xfe/0xff) the real
+     * checkpoint's gate scales carry. The mirror cache
+     * (v4_gpu_expert_attach_cached_ex) drives the shape; any failure leaves
+     * *t NULL and the expert stays on the CPU fp4 path (D6). */
+    if (!t || !w || !scale || O < 1 || I < 1 || I % 32) return 0;
+    if (ds4vk_fault_hit_upload()) {
+        ds4vk_fault_log("upload");
+        *t = NULL;
+        return 0;
+    }
+    int ng = (I + 31) / 32;
+    size_t ns = (size_t)O * (size_t)ng;
+    float *s = malloc(ns * sizeof(float));
+    if (!s) return 0;
+    for (size_t i = 0; i < ns; i++) s[i] = ds4vk_ue8m0(scale[i]);
+    ColiVkTensor *vk = NULL;
+    int ok = device == 0
+        ? coli_vk_tensor_ensure(&vk, w, s, 10, I, O, 32)
+        : coli_vk_dev2_available()
+            ? coli_vk_tensor_ensure2(&vk, w, s, 10, I, O, 32)
+            : 0;
+    free(s);
+    if (!ok) { *t = NULL; return 0; }
+    Dsv4CudaTensor *h = calloc(1, sizeof(*h));
+    if (!h) { coli_vk_tensor_free(vk); *t = NULL; return 0; }
+    h->device = device; h->fmt = 10; h->O = O; h->I = I;
+    h->vk = vk; h->bytes = (long long)coli_vk_tensor_bytes(vk);
+    h->op = DS4VK_OP_EXPERT;   /* COLI_DSV4_VK_OPS=expert gate (M5-1a) */
+    *t = h;
+    stub_upload_log("fp4", device, O, I, 10, h->bytes);
+    return 1;
+}
+
+int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
+                                const uint8_t *scale, int O, int I, int sync) {
+    /* Same-shape in-place refill of an fp4 mirror (LRU recycle in
+     * v4_gpu_expert_attach_cached_ex): overwrite the arena row bytes + re-
+     * expand the UE8M0 scales. Host-visible arena writes are visible to the
+     * device on the next queue submit, so the caller's following compute is
+     * always ordered after the new bytes (sync is a no-op — the VK tier has
+     * no async stream). */
+    (void)sync;
+    if (!t || !t->vk || !w || !scale || t->fmt != 10) return 0;
+    ColiVkTensor *vk = t->vk;
+    if (vk->O != O || vk->I != I) return 0;
+    size_t stride = (size_t)vk->rowWords * 4;      /* padded row bytes */
+    size_t cpu_rb = (size_t)(I + 1) / 2;           /* packed nibbles/row */
+    int ng = (I + 31) / 32;
+    uint8_t *wptr = (uint8_t *)vk->whost;
+    float *sptr = (float *)vk->shost;
+    if (!wptr || !sptr) return 0;
+    for (int o = 0; o < O; o++) {
+        memcpy(wptr + (size_t)o * stride, w + (size_t)o * cpu_rb, cpu_rb);
+        for (int g = 0; g < ng; g++)
+            sptr[(size_t)o * ng + (size_t)g] =
+                ds4vk_ue8m0(scale[(size_t)o * ng + (size_t)g]);
+    }
+    return 1;
 }
 
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t, const uint16_t *w, int O, int I,
@@ -545,12 +644,6 @@ int dsv4_cuda_upload_f32(Dsv4CudaTensor **t, const float *w, int O, int I,
     *t = h;
     stub_upload_log("f32", device, O, I, 0, h->bytes);
     return 1;
-}
-
-int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
-                                const uint8_t *scale, int O, int I, int sync) {
-    (void)t; (void)w; (void)scale; (void)O; (void)I; (void)sync;
-    return 0; /* no fp4 mirrors in v1 (M5) */
 }
 
 /* ---- tensor/activation handles ---- */
@@ -687,6 +780,22 @@ static int ds4vk_fp8_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
     return ok;
 }
 
+/* fp4 matvec (M5-1a): replicates coli_fp4_matvec_ref — the input is
+ * dynamically QDQ'd to fp8 (block=128) first, then the fmt=10 (e2m1,
+ * per-element group scale) matmul consumes the dequantized activations (the
+ * CPU chain's matmul_mxfp4 / rows16_order see exactly these bytes). QDQ
+ * bitwise (M2-2), matmul thresholded — the same contract as the fp8 tier. */
+static int ds4vk_fp4_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
+    size_t n = (size_t)t->I;
+    float *act = malloc(n * sizeof(float));
+    uint8_t *actsc = malloc((n + 127) / 128);
+    if (!act || !actsc) { free(actsc); free(act); return 0; }
+    int ok = coli_vk_activation_qdq(act, actsc, x, 1, t->I, 128) &&
+             coli_vk_matmul(&t->vk, y, act, NULL, NULL, 10, 1, t->I, t->O, 32);
+    free(actsc); free(act);
+    return ok;
+}
+
 /* Grouped matvec (wo_a): the resident weight is the block-diagonal matrix
  * stacked vertically — groups of o_rank rows x group_width columns. The full
  * upload (O=groups*o_rank, I=group_width) is sliced into per-group tensors
@@ -695,35 +804,16 @@ static int ds4vk_fp8_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
  * input slice x + g*group_width. */
 static int ds4vk_grouped_matvec(Dsv4CudaTensor *t, float *y, const float *x,
                                 int groups) {
-    /* M3e-1 (perf): the block-diagonal wo_a's per-group slices are read
-     * DIRECTLY from the arena via offset views — no per-group tensor copies.
-     * The old copies re-read the host-visible VRAM arena over GTT (~50 MB/s)
-     * and cost ~600 ms/layer on first use (measured); the view keeps the same
-     * bytes and the same shader math, so the numerics are unchanged (L2 + L3
-     * re-verified). */
+    /* M3e-3 (perf): the block-diagonal wo_a's per-group slices are read
+     * DIRECTLY from the arena via offset views and ALL groups run as ONE
+     * batched command buffer (1 QDQ over the packed rows + `groups` matmuls,
+     * one submit + one fence) — the per-group loop was 2 submits/group (16/
+     * layer for o_groups=8). The packed-row QDQ is per-row independent
+     * (qdq.comp workgroup per (block,row)), so the numerics are bitwise
+     * unchanged (L2 + L3 re-verified); the M3e-1 view keeps the same bytes
+     * and the same shader math. */
     if (!t || !t->vk || groups < 1 || t->O % groups || t->I % groups) return 0;
-    int Og = t->O / groups, Ig = t->I;
-    size_t n = (size_t)Ig;
-    float *act = malloc(n * sizeof(float));
-    uint8_t *actsc = malloc((n + 127) / 128);
-    if (!act || !actsc) { free(actsc); free(act); return 0; }
-    int ok = 1;
-    ColiVkTensor view = *t->vk;
-    ColiVkTensor *vp = &view;
-    view.fmt = 8;   /* wo_a may be fmt=9 (fp8-bf16 upload); the group slices
-                     * compute as fmt=8 (M3a: numerics unchanged, L3-verified) */
-    view.O = Og;    /* per-group output rows; rowWords stays the FULL row
-                     * stride (the shader reads at woff + o*rowWords) */
-    for (int g = 0; g < groups && ok; g++) {
-        view.woff = (int)((size_t)g * (size_t)Og * (size_t)view.rowWords);
-        view.soff = (int)((size_t)g * (size_t)((Og + 127) / 128) *
-                          (size_t)((Ig + 127) / 128));
-        ok = coli_vk_activation_qdq(act, actsc, x + (size_t)g * Ig, 1, Ig, 128) &&
-             coli_vk_matmul(&vp, y + (size_t)g * Og, act, NULL, NULL,
-                            8, 1, Ig, Og, 1);
-    }
-    free(actsc); free(act);
-    return ok;
+    return coli_vk_matmul_grouped_batch(t->vk, y, x, groups, 8);
 }
 
 /* f32 matvec (route gate logits; also the generic fmt-0 path). */
@@ -780,6 +870,7 @@ int dsv4_cuda_matvec(Dsv4CudaTensor *t, float *y, const float *x) {
     struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
     double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
     int ok = t->fmt == 8 || t->fmt == 9 ? ds4vk_fp8_matvec(t, y, x)
+          : t->fmt == 10 ? ds4vk_fp4_matvec(t, y, x)   /* M5-1a: fp4 experts */
           : t->fmt == 0 ? ds4vk_f32_matvec(t, y, x)
           : t->fmt == 16 ? ds4vk_bf16_matvec(t, y, x) : 0;
     if (ok) ds4vk_prof_tick(t, t0);
@@ -1781,9 +1872,90 @@ int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,
                            Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down, const float *weights,
                            int count, float limit, float *y, const float *x) {
-    (void)gate; (void)up; (void)down; (void)weights; (void)count; (void)limit;
-    (void)y; (void)x;
-    return 0;
+    /* M5-1b: decode-path routed-expert group, batched — TWO submits per layer
+     * per token instead of ~3 per expert (~19 for top-6). The engine's fused
+     * path calls this when ALL of a token's selected experts carry GPU
+     * mirrors. CPU reference: the per-expert coli_v4_expert_forward_ref
+     * accumulation the engine falls back to (gate/up fp4 matvecs -> bf16
+     * round -> swiglu(limit) -> *route_weight -> bf16 round -> down fp4
+     * matvec -> bf16 round -> sum). The VK tier replicates the CPU chain's
+     * rounding points BITWISE host-side (ds4vk_bf16 / ds4vk_sigmoid are the
+     * engine twins, proven by M3c); only the fp4 matvecs are GPU (thresholded,
+     * same contract as the fp8 tier). Phase 1 = QDQ(x) + ALL gate/up matmuls
+     * in ONE command buffer (they share one QDQ — the CPU QDQs per call,
+     * deterministic, so a single pass is bitwise identical); phase 2 =
+     * QDQ(hid rows, S=count) + ALL down matmuls in ONE command buffer. */
+    if (!y || !x || count < 1 || count > 64 || !gate || !up || !down ||
+        limit < 0.0f)
+        return 0;
+    /* op gate + L4 fault injection: the group has no single tensor handle,
+     * gate the group pseudo-op directly (the mirrors carry it too). */
+    if (!ds4vk_op_enabled_g_expert()) return 0;
+    if (ds4vk_fault_hit_g(DS4VK_OP_EXPERT)) {
+        ds4vk_fault_log("expert");
+        return 0;
+    }
+    Dsv4CudaTensor *g0 = gate[0];
+    if (!g0 || !g0->vk) return 0;
+    int H = g0->I, I = g0->O;   /* H = input dim, I = moe_intermediate */
+    if (H < 1 || I < 1 || I % 32 || H % 32) return 0;
+    for (int e = 0; e < count; e++)
+        if (!gate[e] || !up[e] || !down[e] || !gate[e]->vk || !up[e]->vk ||
+            !down[e]->vk || gate[e]->fmt != 10 || up[e]->fmt != 10 ||
+            down[e]->fmt != 10 || gate[e]->I != H || gate[e]->O != I ||
+            up[e]->I != H || up[e]->O != I || down[e]->I != I ||
+            down[e]->O != H)
+            return 0;
+    struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+    double t0 = ts0.tv_sec + ts0.tv_nsec / 1e9;
+    ColiVkTensor *gv[64], *uv[64], *dv[64];
+    for (int e = 0; e < count; e++) {
+        gv[e] = gate[e]->vk;
+        uv[e] = up[e]->vk;
+        dv[e] = down[e]->vk;
+    }
+    float *gatebuf = malloc((size_t)count * (size_t)I * sizeof(float));
+    float *upbuf = malloc((size_t)count * (size_t)I * sizeof(float));
+    float *hid = malloc((size_t)count * (size_t)I * sizeof(float));
+    float *out = malloc((size_t)count * (size_t)H * sizeof(float));
+    if (!gatebuf || !upbuf || !hid || !out) {
+        free(out); free(hid); free(upbuf); free(gatebuf);
+        return 0;
+    }
+    /* Phase 1: one submit for QDQ(x) + every expert's gate/up. */
+    int ok = coli_vk_expert_dsv4_phase1(gv, uv, gatebuf, upbuf, x,
+                                        count, H, I);
+    /* host rounding chain — bitwise vs coli_v4_expert_forward_ref:
+     * bf16(gate) / bf16(up) -> limit clamps -> sigmoid -> * weight -> bf16.
+     * The per-expert down QDQ uses a fresh activation (hid). */
+    if (ok)
+        for (int e = 0; e < count && ok; e++) {
+            const float *g = gatebuf + (size_t)e * I;
+            const float *u = upbuf + (size_t)e * I;
+            float *h = hid + (size_t)e * I;
+            for (int i = 0; i < I; i++) {
+                float gv_ = ds4vk_bf16(g[i]);
+                float uv_ = ds4vk_bf16(u[i]);
+                if (limit > 0.0f) {
+                    gv_ = fminf(gv_, limit);
+                    uv_ = fmaxf(-limit, fminf(uv_, limit));
+                }
+                h[i] = ds4vk_bf16(gv_ * ds4vk_sigmoid(gv_) * uv_ *
+                                   weights[e]);
+            }
+        }
+    /* Phase 2: one submit for QDQ(hid, S=count) + every expert's down. */
+    if (ok) ok = coli_vk_expert_dsv4_phase2(dv, out, hid, count, H, I);
+    if (ok) {
+        memset(y, 0, (size_t)H * sizeof(float));
+        for (int e = 0; e < count; e++) {
+            const float *o = out + (size_t)e * H;
+            for (int i = 0; i < H; i++) y[i] += ds4vk_bf16(o[i]);
+        }
+    }
+    free(out); free(hid); free(upbuf); free(gatebuf);
+    if (ok) ds4vk_prof_tick(g0, t0);
+    return ok;
 }
 
 int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate, Dsv4CudaTensor *up,
